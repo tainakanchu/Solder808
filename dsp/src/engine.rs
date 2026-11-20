@@ -2,28 +2,45 @@ use crate::bd::BassDrum;
 use crate::cb::Cowbell;
 use crate::common::Common;
 use crate::cp::Clap;
-use crate::hh::HiHat;
+use crate::cy::Cymbal;
+use crate::hh::{HiHat, MetalBank};
 use crate::parts::{Part, Unit};
+use crate::rs::RimClaves;
 use crate::sd::Snare;
+use crate::tom::{TomConga, HIGH, LOW, MID};
 use crate::voice::Voice;
 
 pub const OVERSAMPLE: usize = 2;
 pub const BLOCK: usize = 128;
-pub const VOICES: usize = 5;
+/// Voice (channel) indices: 0 BD, 1 SD, 2 HH, 3 CP/MA, 4 CB, 5 LT/LC,
+/// 6 MT/MC, 7 HT/HC, 8 RS/CL, 9 CY. Also the part-table index.
+pub const VOICES: usize = 10;
+const HH: usize = 2;
+const CY: usize = 9;
 
-/// Output trim per voice so circuit volts land near ±1.
-const TRIM: [f64; VOICES] = [0.85, 0.1, 0.3, 0.7, 0.18];
+/// Output trim per voice so circuit volts land near ±1 (BD stays the loudest).
+const TRIM: [f64; VOICES] = [0.85, 0.1, 0.3, 0.7, 0.18, 0.15, 0.15, 0.15, 0.38, 0.43];
 
 /// Trigger slots exposed to the UI.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Slot {
     Bd = 0,
     Sd = 1,
     Ch = 2,
     Oh = 3,
+    /// Clap or maracas (voice 3's switch).
     Cp = 4,
     Cb = 5,
+    /// Low tom or low conga (voice 5's switch).
+    Lt = 6,
+    Mt = 7,
+    Ht = 8,
+    /// Rim shot or claves (voice 8's switch).
+    Rs = 9,
+    Cy = 10,
 }
+
+pub const SLOTS: u32 = 11;
 
 impl Slot {
     pub fn from_u32(v: u32) -> Option<Self> {
@@ -34,8 +51,30 @@ impl Slot {
             3 => Slot::Oh,
             4 => Slot::Cp,
             5 => Slot::Cb,
+            6 => Slot::Lt,
+            7 => Slot::Mt,
+            8 => Slot::Ht,
+            9 => Slot::Rs,
+            10 => Slot::Cy,
             _ => return None,
         })
+    }
+
+    /// (voice index, variant) this slot strikes.
+    fn target(self) -> (usize, u32) {
+        match self {
+            Slot::Bd => (0, 0),
+            Slot::Sd => (1, 0),
+            Slot::Ch => (2, 0),
+            Slot::Oh => (2, 1),
+            Slot::Cp => (3, 0),
+            Slot::Cb => (4, 0),
+            Slot::Lt => (5, 0),
+            Slot::Mt => (6, 0),
+            Slot::Ht => (7, 0),
+            Slot::Rs => (8, 0),
+            Slot::Cy => (9, 0),
+        }
     }
 }
 
@@ -75,6 +114,8 @@ impl Biquad {
 
 pub struct Engine {
     voices: [Box<dyn Voice>; VOICES],
+    metal: MetalBank,
+    isr: f64,
     common: Common,
     unit: Unit,
     aa: [Biquad; 2],
@@ -89,14 +130,21 @@ impl Engine {
     pub fn new(sample_rate: f64) -> Self {
         let isr = sample_rate * OVERSAMPLE as f64;
         let fc = sample_rate * 0.45;
-        Self {
+        let mut e = Self {
             voices: [
                 Box::new(BassDrum::new(isr)),
                 Box::new(Snare::new(isr)),
                 Box::new(HiHat::new(isr)),
                 Box::new(Clap::new(isr)),
                 Box::new(Cowbell::new(isr)),
+                Box::new(TomConga::new(isr, &LOW)),
+                Box::new(TomConga::new(isr, &MID)),
+                Box::new(TomConga::new(isr, &HIGH)),
+                Box::new(RimClaves::new(isr)),
+                Box::new(Cymbal::new(isr)),
             ],
+            metal: MetalBank::default(),
+            isr,
             common: Common::new(isr),
             unit: Unit::default(),
             aa: [
@@ -105,7 +153,19 @@ impl Engine {
             ],
             out: [0.0; BLOCK],
             master: 0.8,
-        }
+        };
+        e.retune_metal();
+        e
+    }
+
+    /// The shared oscillator bank follows the hi-hat's R/C parts.
+    fn retune_metal(&mut self) {
+        self.metal.tune(self.voices[HH].parts(), self.isr);
+    }
+
+    /// Frequencies of the shared metal oscillators (Hz).
+    pub fn metal_hz(&self) -> [f64; 6] {
+        self.metal.hz(self.isr)
     }
 
     /// Parts of a voice (0..VOICES) or of the shared circuitry (`COMMON`).
@@ -118,13 +178,15 @@ impl Engine {
     }
 
     pub fn trigger(&mut self, slot: Slot, accent: f64) {
-        match slot {
-            Slot::Bd => self.voices[0].trigger(accent, 0),
-            Slot::Sd => self.voices[1].trigger(accent, 0),
-            Slot::Ch => self.voices[2].trigger(accent, 0),
-            Slot::Oh => self.voices[2].trigger(accent, 1),
-            Slot::Cp => self.voices[3].trigger(accent, 0),
-            Slot::Cb => self.voices[4].trigger(accent, 0),
+        let (v, variant) = slot.target();
+        self.voices[v].trigger(accent, variant);
+    }
+
+    /// Panel switch of a voice: 3 clap/maracas, 5–7 tom/conga, 8 rim
+    /// shot/claves (0 / 1). Applies from the next trigger; other voices ignore it.
+    pub fn set_switch(&mut self, voice: usize, value: u32) {
+        if let Some(v) = self.voices.get_mut(voice) {
+            v.set_switch(value);
         }
     }
 
@@ -150,6 +212,7 @@ impl Engine {
             v.refresh(&unit);
         }
         self.common.refresh(&unit);
+        self.retune_metal();
     }
 
     pub fn set_part_scale(&mut self, voice: usize, part: usize, scale: f64) {
@@ -165,6 +228,9 @@ impl Engine {
                 p.user_scale = scale;
             }
             v.refresh(&unit);
+            if voice == HH {
+                self.retune_metal();
+            }
         }
     }
 
@@ -175,7 +241,10 @@ impl Engine {
             let mut y = 0.0;
             for _ in 0..OVERSAMPLE {
                 let draw: f64 = self.voices.iter().map(|v| v.accent_draw()).sum();
-                let bus = self.common.bus(draw);
+                let mut bus = self.common.bus(draw);
+                if self.voices[HH].active() || self.voices[CY].active() {
+                    bus.metal = self.metal.tick();
+                }
                 let mut outs = [0.0; VOICES];
                 let mut current = 0.0;
                 let mut any = false;
@@ -202,6 +271,74 @@ impl Engine {
 
     pub fn any_active(&self) -> bool {
         self.voices.iter().any(|v| v.active())
+    }
+}
+
+#[cfg(test)]
+mod instruments {
+    use super::*;
+
+    const SR: f64 = 48_000.0;
+
+    /// (slot, voice whose switch to set, switch value)
+    const CASES: [(u32, usize, u32); 16] = [
+        (0, 0, 0),
+        (1, 0, 0),
+        (2, 0, 0),
+        (3, 0, 0),
+        (4, 3, 0),
+        (4, 3, 1),
+        (5, 0, 0),
+        (6, 5, 0),
+        (6, 5, 1),
+        (7, 6, 0),
+        (7, 6, 1),
+        (8, 7, 0),
+        (8, 7, 1),
+        (9, 8, 0),
+        (9, 8, 1),
+        (10, 0, 0),
+    ];
+
+    #[test]
+    fn every_instrument_sounds_then_sleeps() {
+        for (slot, v, sw) in CASES {
+            let mut e = Engine::new(SR);
+            e.set_switch(v, sw);
+            e.trigger(Slot::from_u32(slot).unwrap(), 1.0);
+            let mut peak = 0.0f32;
+            for _ in 0..(SR as usize / BLOCK / 2) {
+                e.process(BLOCK);
+                assert!(e.out.iter().all(|y| y.is_finite()));
+                peak = e.out.iter().fold(peak, |m, y| m.max(y.abs()));
+            }
+            assert!(peak > 0.1 && peak < 0.99, "slot {slot} sw {sw}: {peak}");
+            crate::circuit::stats::take();
+            for _ in 0..(SR as usize * 4 / BLOCK) {
+                e.process(BLOCK);
+            }
+            let (_, _, maxed) = crate::circuit::stats::take();
+            assert_eq!(maxed, 0, "slot {slot} sw {sw}");
+            assert!(!e.any_active(), "slot {slot} sw {sw} never sleeps");
+        }
+    }
+
+    #[test]
+    fn hihat_and_cymbal_share_the_metal_bank() {
+        let mut e = Engine::new(SR);
+        let hz = e.metal_hz();
+        // Nominal 808 frequencies within tolerance.
+        for (f, n) in hz.iter().zip([205.3, 304.4, 369.6, 522.7, 540.0, 800.0]) {
+            assert!((f / n - 1.0).abs() < 0.1, "{f} vs {n}");
+        }
+        // Editing the hi-hat's oscillator R retunes the bank both voices use.
+        e.set_part_scale(2, 0, 2.0);
+        let hz2 = e.metal_hz();
+        assert!((hz[0] / hz2[0] - 2.0).abs() < 1e-9);
+        assert_eq!(hz[1..], hz2[1..]);
+        // Changing the cymbal's parts does not.
+        e.set_part_scale(9, 0, 2.0);
+        assert_eq!(e.metal_hz(), hz2);
     }
 }
 
@@ -237,7 +374,7 @@ mod fuzz {
             let mut log = Vec::new();
             for blk in 0..(sr as usize * 3 / BLOCK) {
                 if r.f() < 0.05 {
-                    match r.u(5) {
+                    match r.u(6) {
                         0 => {
                             let (v, id, x) = (r.u(VOICES), r.u(4) as u32, r.f());
                             e.set_knob(v, id, x);
@@ -266,11 +403,16 @@ mod fuzz {
                             e.set_accent(x);
                             log.push(format!("accent {x:.3}"));
                         }
+                        4 => {
+                            let (v, x) = (r.u(VOICES), r.u(2) as u32);
+                            e.set_switch(v, x);
+                            log.push(format!("switch {v} {x}"));
+                        }
                         _ => {}
                     }
                 }
                 if blk % 4 == 0 {
-                    for s in 0..6 {
+                    for s in 0..SLOTS {
                         if r.f() < 0.3 {
                             e.trigger(
                                 Slot::from_u32(s).unwrap(),

@@ -15,6 +15,8 @@ use crate::engine::VOICES;
 use crate::parts::{apply_unit, Part, PartKind as K, Unit};
 use crate::voice::{audio_taper, Bus};
 
+/// Tolerance seed salt. It predates the toms (voice 5) and is kept so
+/// existing units keep their values; the new voices use salts 11..15.
 const VOICE_ID: u32 = 5;
 const RAIL_NOMINAL: f64 = 15.0;
 /// Voice output (after trim) → mixer input volts.
@@ -23,16 +25,30 @@ const POT_NAMES: [&str; VOICES] = [
     "VR1 BD level",
     "VR2 SD level",
     "VR3 HH level",
-    "VR4 CP level",
+    "VR4 CP/MA level",
     "VR5 CB level",
+    "VR6 LT/LC level",
+    "VR7 MT/MC level",
+    "VR8 HT/HC level",
+    "VR9 RS/CL level",
+    "VR10 CY level",
 ];
 const MIX_NAMES: [&str; VOICES] = [
     "R4 BD mix",
     "R5 SD mix",
     "R6 HH mix",
-    "R7 CP mix",
+    "R7 CP/MA mix",
     "R8 CB mix",
+    "R11 LT/LC mix",
+    "R12 MT/MC mix",
+    "R13 HT/HC mix",
+    "R14 RS/CL mix",
+    "R15 CY mix",
 ];
+/// Voices whose mixer legs come before the mixer's own parts in the table
+/// (the original five); later voices' legs are appended at the end so the
+/// existing part indices, and therefore every unit's tolerance draws, stay put.
+const FIRST_VOICES: usize = 5;
 
 pub struct Common {
     pm: PartMap,
@@ -75,11 +91,14 @@ impl Common {
         let mut legs = Vec::new();
         let mut pots = Vec::new();
         let mut mixes = Vec::new();
-        for k in 0..VOICES {
+        let mut leg = |cb: &mut CircuitBuilder, pm: &mut PartMap, k: usize| {
             srcs.push(cb.isource(GND, inv));
             legs.push(cb.resistor(inv, GND, 1.0));
             pots.push(pm.add(POT_NAMES[k], K::Pot, 10e3));
             mixes.push(pm.add(MIX_NAMES[k], K::Carbon, 47e3));
+        };
+        for k in 0..FIRST_VOICES {
+            leg(&mut cb, &mut pm, k);
         }
         cb.opamp(GND, inv, out);
         pm.r(&mut cb, out, inv, "R9 mixer feedback", 47e3);
@@ -93,6 +112,9 @@ impl Common {
         );
         pm.c(&mut cb, out, oc, "C3 output", K::Electrolytic, 10e-6);
         pm.r(&mut cb, oc, GND, "R10 output load", 10e3);
+        for k in FIRST_VOICES..VOICES {
+            leg(&mut cb, &mut pm, k);
+        }
 
         let to_arr = |v: Vec<ElemId>| -> [ElemId; VOICES] {
             v.try_into().unwrap_or_else(|_| unreachable!())
@@ -160,6 +182,7 @@ impl Common {
         Bus {
             accent: self.accent_knob * 1.25 * loading,
             rail: self.rail_v / RAIL_NOMINAL,
+            metal: 0.0,
         }
     }
 
@@ -180,10 +203,10 @@ impl Common {
         if !any_active && self.mix.energy() < 1e-6 {
             return 0.0;
         }
-        for k in 0..VOICES {
+        for (k, &out) in outs.iter().enumerate() {
             self.mix.set_current(
                 self.srcs[k],
-                outs[k] * MIX_IN * self.ratio[k] * self.g_leg[k],
+                out * MIX_IN * self.ratio[k] * self.g_leg[k],
             );
         }
         self.mix.rail = rail;

@@ -54,6 +54,13 @@ pub extern "C" fn engine_set_knob(e: *mut Engine, voice: u32, id: u32, value: f6
     eng!(e).set_knob(voice as usize, id, value);
 }
 
+/// Panel switch per voice: 3 clap(0)/maracas(1), 5–7 tom(0)/conga(1),
+/// 8 rim shot(0)/claves(1). Applies from the next trigger; ignored elsewhere.
+#[no_mangle]
+pub extern "C" fn engine_set_switch(e: *mut Engine, voice: u32, value: u32) {
+    eng!(e).set_switch(voice as usize, value);
+}
+
 #[no_mangle]
 pub extern "C" fn engine_set_master(e: *mut Engine, value: f64) {
     eng!(e).master = value.clamp(0.0, 2.0);

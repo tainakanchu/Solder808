@@ -2,7 +2,14 @@
 //! their R and C parts) summed into a multiple-feedback band-pass op-amp
 //! filter, a VCA fed by closed / open envelope peak detectors, and a final RC
 //! high-pass. A closed trigger chokes the open envelope like the original.
+//!
+//! The six oscillators are the 808's shared "metal" source: the cymbal filters
+//! the same bank. They live in [`MetalBank`], owned by the engine, which
+//! publishes their sum on [`Bus::metal`]; their R and C parts stay in this
+//! voice's part table (indices 0..12), so tolerance, aging and manual part
+//! edits retune the bank for both voices at once.
 
+use crate::blocks::Square;
 use crate::circuit::{Circuit, CircuitBuilder, ElemId, Node, GND};
 use crate::parts::{apply_unit, Part, PartKind as K, Unit};
 use crate::voice::{audio_taper, Bus, Pulse, Sleeper, Voice};
@@ -15,6 +22,50 @@ const OSC_C: f64 = 22e-9;
 const OSC_K: f64 = 1.4;
 const VR_DECAY_MAX: f64 = 600e3;
 
+/// The six square oscillators shared by the hi-hat and the cymbal.
+///
+/// Why one bank owned by the engine rather than a copy per voice: on the 808
+/// both voices tap the same oscillators, so a hi-hat and a cymbal struck
+/// together beat against identical frequencies and phases. A second bank
+/// computed from the same formula would need its own parts (different
+/// tolerance draws, so slightly different pitches) and its own phases, and
+/// the pair would no longer sound like one piece of metal. The bank only runs
+/// while either voice is awake; its phases simply hold while both sleep, which
+/// is inaudible because a free-running bank has arbitrary phase anyway.
+pub struct MetalBank {
+    osc: [Square; 6],
+}
+
+impl Default for MetalBank {
+    fn default() -> Self {
+        let ph = [0.0, 0.31, 0.57, 0.11, 0.83, 0.42];
+        Self {
+            osc: ph.map(|phase| Square { phase, inc: 0.0 }),
+        }
+    }
+}
+
+impl MetalBank {
+    /// Retune from the hi-hat's part table (R1, C1, … R6, C6 at indices 0..12).
+    pub fn tune(&mut self, hh_parts: &[Part], sr: f64) {
+        for (i, o) in self.osc.iter_mut().enumerate() {
+            let r = hh_parts[2 * i].effective;
+            let c = hh_parts[2 * i + 1].effective;
+            o.inc = 1.0 / (OSC_K * r * c * sr);
+        }
+    }
+
+    /// Sum of the six ±1 squares.
+    pub fn tick(&mut self) -> f64 {
+        self.osc.iter_mut().map(|o| o.tick()).sum()
+    }
+
+    /// Current frequencies (Hz) at sample rate `sr`.
+    pub fn hz(&self, sr: f64) -> [f64; 6] {
+        self.osc.map(|o| o.inc * sr)
+    }
+}
+
 pub struct HiHat {
     a: Circuit,
     b: Circuit,
@@ -23,8 +74,6 @@ pub struct HiHat {
     pulse_oh: Pulse,
     sleep: Sleeper,
     sr: f64,
-    phase: [f64; 6],
-    inc: [f64; 6],
     metal: ElemId,
     trig_ch: ElemId,
     trig_oh: ElemId,
@@ -134,8 +183,6 @@ impl HiHat {
             pulse_oh: Pulse::new(sr),
             sleep: Sleeper::new(sr),
             sr,
-            phase: [0.0, 0.31, 0.57, 0.11, 0.83, 0.42],
-            inc: [0.0; 6],
             metal,
             trig_ch,
             trig_oh,
@@ -164,19 +211,6 @@ impl HiHat {
     }
 }
 
-/// PolyBLEP correction for a naive square to reduce aliasing.
-fn poly_blep(t: f64, dt: f64) -> f64 {
-    if t < dt {
-        let t = t / dt;
-        t + t - t * t - 1.0
-    } else if t > 1.0 - dt {
-        let t = (t - 1.0) / dt;
-        t * t + t + t + 1.0
-    } else {
-        0.0
-    }
-}
-
 impl Voice for HiHat {
     fn parts(&self) -> &[Part] {
         &self.parts
@@ -195,11 +229,6 @@ impl Voice for HiHat {
         let ri = self.r_decay_index();
         self.parts[ri + 1].nominal = VR_DECAY_MAX * audio_taper(self.knob_decay);
         apply_unit(&mut self.parts, unit, VOICE_ID);
-        for i in 0..6 {
-            let r = self.parts[2 * i].effective;
-            let c = self.parts[2 * i + 1].effective;
-            self.inc[i] = 1.0 / (OSC_K * r * c * self.sr);
-        }
         for &(id, pi, cap) in &self.map_a {
             let v = self.parts[pi].effective;
             if cap {
@@ -246,21 +275,11 @@ impl Voice for HiHat {
                 self.a.set_resistance(self.choke, 1e9);
             }
         }
-        let mut sum = 0.0;
-        for i in 0..6 {
-            let dt = self.inc[i];
-            let t = self.phase[i];
-            let mut sq = if t < 0.5 { 1.0 } else { -1.0 };
-            sq += poly_blep(t, dt);
-            sq -= poly_blep((t + 0.5) % 1.0, dt);
-            sum += sq;
-            self.phase[i] = (t + dt) % 1.0;
-        }
         let ch = self.pulse_ch.next(bus);
         let oh = self.pulse_oh.next(bus);
         self.a.rail = bus.rail;
         self.b.rail = bus.rail;
-        self.a.set_voltage(self.metal, sum * 0.5);
+        self.a.set_voltage(self.metal, bus.metal * 0.5);
         self.a.set_voltage(self.trig_ch, ch);
         self.a.set_voltage(self.trig_oh, oh);
         self.a.step();

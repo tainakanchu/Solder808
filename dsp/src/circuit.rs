@@ -274,6 +274,11 @@ impl Circuit {
         }
     }
 
+    /// Number of non-ground nodes (nodes are numbered 1..=node_count()).
+    pub fn node_count(&self) -> usize {
+        self.nn
+    }
+
     /// Largest absolute node voltage; used to decide when a voice is silent.
     pub fn energy(&self) -> f64 {
         self.x[..self.nn].iter().fold(0.0f64, |m, v| m.max(v.abs()))

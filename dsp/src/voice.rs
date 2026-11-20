@@ -8,6 +8,10 @@ pub struct Bus {
     pub accent: f64,
     /// Supply rail relative to nominal.
     pub rail: f64,
+    /// Summed output of the six shared square-wave oscillators (the "metal"
+    /// source the hi-hat and cymbal both filter). Only computed while one of
+    /// those two voices is awake; 0 otherwise.
+    pub metal: f64,
 }
 
 impl Default for Bus {
@@ -15,6 +19,7 @@ impl Default for Bus {
         Self {
             accent: 1.0,
             rail: 1.0,
+            metal: 0.0,
         }
     }
 }
@@ -24,6 +29,9 @@ pub trait Voice {
     fn parts_mut(&mut self) -> &mut [Part];
     /// Knob (0..1). Id 0 (level) is handled by the engine.
     fn set_knob(&mut self, id: u32, value: f64);
+    /// Panel switch (e.g. tom/conga). Takes effect on the next trigger, so a
+    /// ringing note is not retuned mid-decay. Voices without a switch ignore it.
+    fn set_switch(&mut self, _value: u32) {}
     /// Push part values (after tolerance/aging) into the circuit.
     fn refresh(&mut self, unit: &Unit);
     /// `variant` selects closed/open on the hi-hat voice.
