@@ -4,12 +4,19 @@ use crate::circuit::{Circuit, CircuitBuilder, ElemId, Node, GND};
 use crate::parts::{apply_unit, Part, PartKind, Unit};
 
 /// Part list plus the circuit elements each part drives.
+///
+/// A voice split into several circuits keeps one part table: set `target`
+/// to the circuit's index before adding its elements, then refresh with
+/// `refresh_all` / `push_all` (index order). `refresh` / `push` cover
+/// target 0 only.
 #[derive(Default)]
 pub struct PartMap {
     pub parts: Vec<Part>,
-    res: Vec<(ElemId, usize)>,
-    caps: Vec<(ElemId, usize)>,
-    diodes: Vec<(ElemId, usize)>,
+    /// Circuit index recorded with every element added from now on.
+    pub target: usize,
+    res: Vec<(usize, ElemId, usize)>,
+    caps: Vec<(usize, ElemId, usize)>,
+    diodes: Vec<(usize, ElemId, usize)>,
 }
 
 impl PartMap {
@@ -28,7 +35,7 @@ impl PartMap {
     ) -> usize {
         let e = cb.resistor(a, b, ohms);
         let i = self.add(name, PartKind::Carbon, ohms);
-        self.res.push((e, i));
+        self.res.push((self.target, e, i));
         i
     }
 
@@ -43,14 +50,14 @@ impl PartMap {
     ) -> usize {
         let e = cb.capacitor(a, b, f);
         let i = self.add(name, kind, f);
-        self.caps.push((e, i));
+        self.caps.push((self.target, e, i));
         i
     }
 
     pub fn d(&mut self, cb: &mut CircuitBuilder, a: Node, k: Node, name: &'static str) -> usize {
         let e = cb.diode(a, k, 2.52e-9, 1.752, 0.02585);
         let i = self.add(name, PartKind::Diode, 2.52e-9);
-        self.diodes.push((e, i));
+        self.diodes.push((self.target, e, i));
         i
     }
 
@@ -59,19 +66,39 @@ impl PartMap {
         self.push(c, unit);
     }
 
+    pub fn refresh_all(&mut self, cs: &mut [&mut Circuit], unit: &Unit, voice_id: u32) {
+        apply_unit(&mut self.parts, unit, voice_id);
+        self.push_all(cs, unit);
+    }
+
     /// Push current effective values without recomputing them.
     pub fn push(&self, c: &mut Circuit, unit: &Unit) {
-        for &(e, i) in &self.res {
+        self.push_to(0, c, unit);
+    }
+
+    pub fn push_all(&self, cs: &mut [&mut Circuit], unit: &Unit) {
+        for (k, c) in cs.iter_mut().enumerate() {
+            self.push_to(k, c, unit);
+        }
+    }
+
+    fn push_to(&self, k: usize, c: &mut Circuit, unit: &Unit) {
+        for &(_, e, i) in self.res.iter().filter(|r| r.0 == k) {
             c.set_resistance(e, self.parts[i].effective);
         }
-        for &(e, i) in &self.caps {
+        for &(_, e, i) in self.caps.iter().filter(|r| r.0 == k) {
             c.set_capacitance(e, self.parts[i].effective);
         }
         let vt = unit.vt();
-        for &(e, i) in &self.diodes {
+        for &(_, e, i) in self.diodes.iter().filter(|r| r.0 == k) {
             let p = &self.parts[i];
             c.set_diode(e, p.effective, p.n, vt);
         }
+    }
+
+    /// Effective value of part `i`.
+    pub fn eff(&self, i: usize) -> f64 {
+        self.parts[i].effective
     }
 }
 
@@ -106,14 +133,61 @@ pub fn peak_env(
     r_discharge: f64,
 ) -> (ElemId, Node) {
     let t = cb.node();
+    let src = cb.vsource(t, GND);
+    (src, peak_det(cb, pm, t, names, 1e3, c, r_discharge))
+}
+
+/// Peak detector hanging off an existing trigger node: R → diode → C ∥ R.
+/// Returns the envelope node.
+pub fn peak_det(
+    cb: &mut CircuitBuilder,
+    pm: &mut PartMap,
+    trig: Node,
+    names: [&'static str; 4],
+    r_charge: f64,
+    c: f64,
+    r_discharge: f64,
+) -> Node {
     let k = cb.node();
     let env = cb.node();
-    let src = cb.vsource(t, GND);
-    pm.r(cb, t, k, names[0], 1e3);
+    pm.r(cb, trig, k, names[0], r_charge);
     pm.d(cb, k, env, names[1]);
     pm.c(cb, env, GND, names[2], PartKind::Electrolytic, c);
     pm.r(cb, env, GND, names[3], r_discharge);
-    (src, env)
+    env
+}
+
+/// Bridged-T resonator in an inverting op-amp's feedback path, struck through
+/// a series C–R from `drive` (the 808's SD / RS / CL structure):
+/// C1 out→mid, C2 mid→inv, Rb mid→gnd, Rf out→inv.
+/// f0 ≈ 1 / (2π C √(Rb·Rf)), Q ≈ ½ √(Rf / Rb). Names: C1, C2, Rb, Rf,
+/// drive C, drive R. `pos` is the op-amp's + input (GND, or a regeneration
+/// divider's tap the caller wires up). Returns the op-amp output node.
+#[allow(clippy::too_many_arguments)]
+pub fn bridged_t(
+    cb: &mut CircuitBuilder,
+    pm: &mut PartMap,
+    drive: Node,
+    pos: Node,
+    names: [&'static str; 6],
+    c: f64,
+    rb: f64,
+    rf: f64,
+    c_drive: f64,
+    r_drive: f64,
+) -> Node {
+    let ka = cb.node();
+    let inv = cb.node();
+    let mid = cb.node();
+    let out = cb.node();
+    pm.c(cb, out, mid, names[0], PartKind::FilmCap, c);
+    pm.c(cb, mid, inv, names[1], PartKind::FilmCap, c);
+    pm.r(cb, mid, GND, names[2], rb);
+    pm.r(cb, out, inv, names[3], rf);
+    pm.c(cb, drive, ka, names[4], PartKind::Ceramic, c_drive);
+    pm.r(cb, ka, inv, names[5], r_drive);
+    cb.opamp(pos, inv, out);
+    out
 }
 
 /// Squared envelope-to-gain law used by the behavioral VCAs.
@@ -153,15 +227,37 @@ fn blep(t: f64, dt: f64) -> f64 {
 }
 
 /// xorshift32 white noise in [-1, 1).
-pub struct Noise(pub u32);
+pub struct Noise {
+    state: u32,
+    #[cfg(test)]
+    seed: u32,
+}
 
 impl Noise {
+    pub fn new(seed: u32) -> Self {
+        Self {
+            state: seed,
+            #[cfg(test)]
+            seed,
+        }
+    }
+
     pub fn tick(&mut self) -> f64 {
-        let mut x = self.0;
+        let mut x = self.state;
         x ^= x << 13;
         x ^= x >> 17;
         x ^= x << 5;
-        self.0 = x;
+        self.state = x;
         (x as f64 / u32::MAX as f64) * 2.0 - 1.0
+    }
+
+    /// Called on every trigger. Tests can make each note start the sequence
+    /// over, so runs that differ only in how long a voice was awake between
+    /// notes can be compared sample for sample.
+    pub fn strike(&mut self) {
+        #[cfg(test)]
+        if crate::voice::testing::restart_sources() {
+            self.state = self.seed;
+        }
     }
 }

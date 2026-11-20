@@ -1,7 +1,11 @@
-export const VOICES = ['BD', 'SD', 'HH', 'CP', 'CB'] as const
+/** Engine voices (knob `voice`, part-table index). LT/MT/HT switch to congas, RS to claves, CP to maracas. */
+export const VOICES = ['BD', 'SD', 'HH', 'CP', 'CB', 'LT', 'MT', 'HT', 'RS', 'CY'] as const
 /** Part-table index of the shared circuitry (supply, accent line, mixer). */
 export const COMMON = VOICES.length
-export const SLOTS = ['BD', 'SD', 'CH', 'OH', 'CP', 'CB'] as const
+/** Trigger slots, also the sequencer rows. */
+export const SLOTS = ['BD', 'SD', 'CH', 'OH', 'CP', 'CB', 'LT', 'MT', 'HT', 'RS', 'CY'] as const
+/** Voice that a trigger slot plays (CH and OH share the hi-hat). */
+export const slotVoice = (slot: number) => (slot <= 1 ? slot : slot <= 3 ? 2 : slot - 1)
 /** Steps per bar; patterns are one or two bars long. */
 export const STEPS = 16
 export const MAX_STEPS = 32
@@ -24,12 +28,17 @@ export type SyncMode = 'internal' | 'midi'
 export type ToWorklet =
   | { type: 'trigger'; slot: number; accent: number }
   | { type: 'knob'; voice: number; id: number; value: number }
+  /** Sound switch (CP/MA, tom/conga, RS/CL): 0 = first sound, 1 = alternate; applies from the next trigger. */
+  | { type: 'switch'; voice: number; value: number }
   | { type: 'unit'; seed: number; age: number; temp: number }
   | { type: 'part'; voice: number; index: number; scale: number }
   | { type: 'master'; value: number }
   | { type: 'accent'; value: number }
   | { type: 'seq'; vel: Velocities; rolls: Rolls; length: number; bpm: number; swing: number; playing: boolean }
+  /** Requests a 'parts' reply; only sent while the parts table is open. */
   | { type: 'getParts' }
+  /** Engine oversampling: 2 = full quality, 1 = light (about half the load). Ignored by engines without it. */
+  | { type: 'oversample'; factor: 1 | 2 }
   /** Follow the internal tempo or incoming MIDI clock. */
   | { type: 'sync'; mode: SyncMode }
   /** MIDI realtime message; `frame` is when it should take effect on the context timeline. */
@@ -43,8 +52,9 @@ export type FromWorklet =
   /**
    * Share of the real-time budget spent rendering, 0..1+ (above 1 = dropouts); peakLoad −1 = unknown.
    * clockBpm is the tempo measured from MIDI clock, −1 when not following it.
+   * oversample is the engine's current factor (1 or 2), 0 when the engine cannot switch it.
    */
-  | { type: 'stats'; load: number; peakLoad: number; clockBpm: number }
+  | { type: 'stats'; load: number; peakLoad: number; clockBpm: number; oversample: number }
   | { type: 'parts'; voices: PartInfo[][] }
   | { type: 'error'; message: string }
   /** The engine was rebuilt after an error; settings must be sent again. */

@@ -42,6 +42,20 @@ pub extern "C" fn engine_process(e: *mut Engine, frames: u32) {
     eng!(e).process(frames as usize);
 }
 
+/// Internal oversampling factor: 1 or 2 (default 2); other values are
+/// ignored. Applies from the next `engine_process`; all settings carry over,
+/// ringing notes are cut behind a short fade.
+#[no_mangle]
+pub extern "C" fn engine_set_oversample(e: *mut Engine, factor: u32) {
+    eng!(e).set_oversample(factor);
+}
+
+/// Oversampling factor in use (1 or 2).
+#[no_mangle]
+pub extern "C" fn engine_oversample(e: *mut Engine) -> u32 {
+    eng!(e).oversample() as u32
+}
+
 #[no_mangle]
 pub extern "C" fn engine_trigger(e: *mut Engine, slot: u32, accent: f64) {
     if let Some(s) = Slot::from_u32(slot) {
@@ -52,6 +66,13 @@ pub extern "C" fn engine_trigger(e: *mut Engine, slot: u32, accent: f64) {
 #[no_mangle]
 pub extern "C" fn engine_set_knob(e: *mut Engine, voice: u32, id: u32, value: f64) {
     eng!(e).set_knob(voice as usize, id, value);
+}
+
+/// Panel switch per voice: 3 clap(0)/maracas(1), 5–7 tom(0)/conga(1),
+/// 8 rim shot(0)/claves(1). Applies from the next trigger; ignored elsewhere.
+#[no_mangle]
+pub extern "C" fn engine_set_switch(e: *mut Engine, voice: u32, value: u32) {
+    eng!(e).set_switch(voice as usize, value);
 }
 
 #[no_mangle]

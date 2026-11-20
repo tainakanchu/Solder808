@@ -42,6 +42,11 @@
   gap: 16px;
 }
 
+/* Grid items default to min-width: auto; let wide content (the parts table) scroll inside its panel instead. */
+.app > * {
+  min-width: 0;
+}
+
 .top {
   display: flex;
   flex-wrap: wrap;
@@ -115,12 +120,20 @@
 
 .row {
   display: grid;
-  grid-template-columns: 116px repeat(16, minmax(24px, 1fr));
+  grid-template-columns: 176px repeat(16, minmax(26px, 1fr));
   gap: 4px;
-  min-width: 600px;
+  min-width: 652px;
+}
+
+.label {
+  display: flex;
+  gap: 4px;
+  min-width: 0;
 }
 
 .pad {
+  flex: 1 1 auto;
+  min-width: 0;
   font-size: 11px;
   padding: 0 8px;
   height: 34px;
@@ -135,6 +148,7 @@
 .pad b {
   font-size: 12px;
   width: 22px;
+  flex: none;
 }
 
 .pad span {
@@ -151,6 +165,99 @@
 .pad.hit {
   background: var(--accent);
   color: var(--accent-ink);
+}
+
+/* Two-way sound switch: both sounds visible, the selected one filled; one tap flips it. */
+.sw {
+  flex: none;
+  display: inline-flex;
+  align-items: stretch;
+  padding: 0;
+  height: 34px;
+  border-color: var(--ink);
+  overflow: hidden;
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 700;
+  touch-action: manipulation;
+}
+
+.sw span {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  color: var(--muted);
+}
+
+.sw span.on {
+  background: var(--ink);
+  color: var(--bg);
+}
+
+.sw:hover span:not(.on) {
+  color: var(--ink);
+}
+
+.voice h2 .sw,
+.voice-sub .sw {
+  height: 24px;
+  margin-left: 8px;
+  vertical-align: middle;
+}
+
+.group-head {
+  height: 26px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  align-items: center;
+  text-align: left;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.group-head .label {
+  align-items: center;
+  gap: 6px;
+  padding: 0 8px;
+  height: 100%;
+  border: 1px dashed var(--line);
+  border-radius: 6px;
+  white-space: nowrap;
+}
+
+.group-head:hover .label,
+.group-head:focus-visible .label {
+  border-color: var(--accent);
+  color: var(--ink);
+}
+
+.group-head .chev {
+  font-size: 10px;
+  width: 10px;
+}
+
+.group-head .short {
+  display: none;
+}
+
+.group-head .hint {
+  grid-column: 2 / -1;
+  font-size: 11px;
+}
+
+.peek {
+  height: 8px;
+  border-radius: 4px;
+  background: var(--cell);
+}
+
+.peek.on {
+  background: var(--on);
+}
+
+.peek.now {
+  box-shadow: inset 0 -3px 0 var(--ink);
 }
 
 .cell {
@@ -184,6 +291,7 @@
 
 .tabs {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 6px;
   margin-bottom: 10px;
@@ -193,7 +301,8 @@
   margin: 0 8px 0 0;
 }
 
-.tabs .active {
+.tabs .active,
+.voice-tabs .active {
   background: var(--ink);
   color: var(--bg);
   border-color: var(--ink);
@@ -400,6 +509,11 @@ td.scale button {
   padding: 3px 8px;
 }
 
+/* The quality choices are longer than the other selects. */
+.unit-controls select.quality {
+  width: auto;
+}
+
 .bars {
   display: flex;
 }
@@ -456,6 +570,18 @@ td.scale button {
   font-size: 0.85rem;
 }
 
+.notice {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5em;
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  font-size: 0.85rem;
+}
+
 .clock-bpm {
   font-family: var(--mono);
   font-size: 12px;
@@ -467,6 +593,131 @@ td.scale button {
   align-items: center;
   gap: 6px;
   font-size: 12px;
+}
+
+.voice h2 {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.voice-note {
+  font-size: 11px;
+  color: var(--muted);
+  margin: -4px 0 8px;
+}
+
+.voice-tabs {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 8px;
+}
+
+.voice-tabs button {
+  flex: 1 1 0;
+  min-width: 0;
+  padding: 4px 0;
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.voice-sub {
+  display: flex;
+  align-items: center;
+  font-size: 13px;
+  margin-bottom: 8px;
+  min-height: 24px;
+}
+
+.knob.secondary {
+  grid-column: 1 / -1;
+  opacity: 0.6;
+}
+
+/* Phones and narrow windows: each row wraps its bar into two lines of eight
+   (steps 1–8 over 9–16, so beats line up vertically) instead of scrolling sideways. */
+@media (max-width: 760px) {
+  .app {
+    padding-left: 12px;
+    padding-right: 12px;
+  }
+
+  .seq {
+    padding: 12px 10px;
+  }
+
+  .bar {
+    gap: 8px;
+  }
+
+  .row {
+    grid-template-columns: 72px repeat(8, minmax(0, 1fr));
+    gap: 3px;
+    min-width: 0;
+  }
+
+  .row > .label {
+    grid-row: span 2;
+    flex-direction: column;
+    gap: 3px;
+  }
+
+  .row .pad {
+    height: auto;
+    flex-direction: column;
+    align-items: flex-start;
+    justify-content: center;
+    gap: 0;
+    padding: 0 5px;
+  }
+
+  .pad span {
+    font-size: 10px;
+    max-width: 100%;
+  }
+
+  .switchable .pad span {
+    display: none;
+  }
+
+  .row .sw {
+    height: 28px;
+  }
+
+  .row .sw span {
+    width: 50%;
+    flex: 1;
+  }
+
+  .cell {
+    height: 30px;
+  }
+
+  .group-head {
+    height: auto;
+    row-gap: 4px;
+  }
+
+  .row.group-head > .label {
+    flex-direction: row;
+    justify-content: center;
+    gap: 4px;
+    padding: 4px 6px;
+  }
+
+  .group-head .long {
+    display: none;
+  }
+
+  .group-head .short {
+    display: inline;
+  }
+
+  .group-head .hint {
+    grid-row: span 2;
+    align-self: center;
+  }
 }
 
 .site-footer {

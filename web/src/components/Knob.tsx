@@ -8,12 +8,13 @@ type Props = {
   step?: number
   format?: (v: number) => string
   onChange: (v: number) => void
+  className?: string
 }
 
-export function Knob({ label, value, min = 0, max = 1, step = 0.01, format, onChange }: Props) {
+export function Knob({ label, value, min = 0, max = 1, step = 0.01, format, onChange, className }: Props) {
   const id = useId()
   return (
-    <div className="knob">
+    <div className={className ? `knob ${className}` : 'knob'}>
       <label htmlFor={id}>{label}</label>
       <input
         id={id}
