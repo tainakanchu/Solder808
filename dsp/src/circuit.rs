@@ -217,6 +217,8 @@ impl CircuitBuilder {
             dense_only: false,
             lu: vec![0.0; size * size],
             bp: vec![0.0; size],
+            dc: vec![0.0; size],
+            dc_mark: vec![0.0; size],
             dirty: true,
             last_iters: 0,
             replans: 0,
@@ -307,6 +309,9 @@ pub struct Circuit {
     pub(crate) dense_only: bool,
     lu: Vec<f64>,
     bp: Vec<f64>,
+    /// Last DC operating point found, and the one marked before a change.
+    dc: Vec<f64>,
+    dc_mark: Vec<f64>,
     dirty: bool,
     pub last_iters: usize,
     /// Number of times the sparse plan was rebuilt (diagnostics).
@@ -385,47 +390,111 @@ impl Circuit {
     }
 
     fn rebuild_linear(&mut self) {
-        let n = self.size;
-        let nn = self.nn;
-        let a = &mut self.a_lin;
-        a.iter_mut().for_each(|v| *v = 0.0);
-        for i in 0..nn {
-            a[i * n + i] += GMIN;
-        }
-        for e in &self.elems {
-            match *e {
-                Elem::R { a: p, b: q, g } => stamp_g(a, n, p, q, g),
-                Elem::I { .. } => {}
-                Elem::C {
-                    a: p, b: q, geq, ..
-                } => stamp_g(a, n, p, q, geq),
-                Elem::V {
-                    a: p, b: q, row, ..
-                } => {
-                    let r = nn + row;
-                    if p != GND {
-                        a[(p - 1) * n + r] += 1.0;
-                        a[r * n + p - 1] += 1.0;
-                    }
-                    if q != GND {
-                        a[(q - 1) * n + r] -= 1.0;
-                        a[r * n + q - 1] -= 1.0;
-                    }
-                }
-                Elem::OpAmp { out, row, .. } => {
-                    let r = nn + row;
-                    a[(out - 1) * n + r] += 1.0;
-                    a[r * n + out - 1] += 1.0;
-                }
-                Elem::D { .. } => {}
-            }
-        }
+        stamp_linear(&self.elems, &mut self.a_lin, self.size, self.nn, true);
         // Nonlinear elements at their nominal values.
         for t in &self.nl {
-            t.stamp(a, n, t.c0);
+            t.stamp(&mut self.a_lin, self.size, t.c0);
         }
         self.dirty = false;
         self.lowrank = false;
+    }
+
+    /// DC operating point (capacitors open, sources at their present values)
+    /// by Newton on the dense matrix, starting from the last one found.
+    /// Leaves it in `dc`; false if it did not converge.
+    fn solve_dc(&mut self) -> bool {
+        let (n, nn, m) = (self.size, self.nn, self.nl.len());
+        for _ in 0..200 {
+            stamp_linear(&self.elems, &mut self.a, n, nn, false);
+            self.a_stale = true;
+            self.b.iter_mut().for_each(|v| *v = 0.0);
+            for &i in &self.srcs {
+                match self.elems[i] {
+                    Elem::V { v, row, .. } => self.b[nn + row] = v,
+                    Elem::I { a: p, b: q, i } => stamp_i(&mut self.b, q, p, i),
+                    _ => {}
+                }
+            }
+            let mut limited = false;
+            for j in 0..m {
+                let raw = self.nl[j].vdot(&self.dc) * self.nl[j].vsign;
+                let (lim, beta) = self.linearize(j, raw);
+                limited |= lim;
+                self.nl[j].stamp(&mut self.a, n, self.cval[j]);
+                for &(i, sgn) in self.nl[j].u() {
+                    self.b[i] += sgn * beta;
+                }
+            }
+            if !solve(&mut self.a, &mut self.b, &mut self.perm, n) {
+                return false;
+            }
+            let mut delta = 0.0f64;
+            for (d, &v) in self.dc.iter_mut().zip(&self.b) {
+                delta = delta.max((v - *d).abs());
+                *d = v;
+            }
+            if !limited
+                && delta <= 1e-13 * (1.0 + self.dc.iter().fold(0.0f64, |m, v| m.max(v.abs())))
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Remember the present DC operating point, before element values change,
+    /// for a following [`Circuit::settle_dc`].
+    pub fn mark_dc(&mut self) {
+        if self.solve_dc() {
+            self.dc_mark.copy_from_slice(&self.dc);
+        } else {
+            self.dc_mark.iter_mut().for_each(|v| *v = f64::NAN);
+        }
+    }
+
+    /// Move the circuit onto the DC operating point of its present element
+    /// values and sources, without time-stepping. With `reset` (a silent
+    /// circuit) the whole state becomes that point. Otherwise the change since
+    /// [`Circuit::mark_dc`] is added to the state, so a ringing circuit keeps
+    /// ringing around the new point instead of being kicked by the step.
+    pub fn settle_dc(&mut self, reset: bool) {
+        if !self.solve_dc() {
+            return;
+        }
+        let shift = !reset && self.dc_mark.iter().all(|v| v.is_finite());
+        for k in 0..self.size {
+            let (new, old) = (self.dc[k], self.dc_mark[k]);
+            if shift {
+                self.x[k] += new - old;
+                self.x_prev[k] += new - old;
+            } else {
+                self.x[k] = new;
+                self.x_prev[k] = new;
+            }
+        }
+        for &i in &self.caps {
+            if let Elem::C {
+                a: p,
+                b: q,
+                v_prev,
+                i_prev,
+                ..
+            } = &mut self.elems[i]
+            {
+                *v_prev = node_v(&self.x, *p) - node_v(&self.x, *q);
+                if !shift {
+                    *i_prev = 0.0;
+                }
+            }
+        }
+        for t in &self.nl {
+            let v = t.vsign * t.vdot(&self.x);
+            match &mut self.elems[t.elem] {
+                Elem::D { vd, .. } | Elem::OpAmp { vd, .. } => *vd = v,
+                _ => {}
+            }
+        }
+        self.dc_mark.copy_from_slice(&self.dc);
     }
 
     /// Factor `a_lin` and precompute Z and W. Leaves `lowrank` false (so the
@@ -1044,6 +1113,42 @@ fn node_v(x: &[f64], n: Node) -> f64 {
         0.0
     } else {
         x[n - 1]
+    }
+}
+
+/// Stamp the linear elements (capacitors as their trapezoidal conductance,
+/// or open when `caps` is false) into `a`, which is cleared first.
+fn stamp_linear(elems: &[Elem], a: &mut [f64], n: usize, nn: usize, caps: bool) {
+    a.iter_mut().for_each(|v| *v = 0.0);
+    for i in 0..nn {
+        a[i * n + i] += GMIN;
+    }
+    for e in elems {
+        match *e {
+            Elem::R { a: p, b: q, g } => stamp_g(a, n, p, q, g),
+            Elem::C {
+                a: p, b: q, geq, ..
+            } if caps => stamp_g(a, n, p, q, geq),
+            Elem::V {
+                a: p, b: q, row, ..
+            } => {
+                let r = nn + row;
+                if p != GND {
+                    a[(p - 1) * n + r] += 1.0;
+                    a[r * n + p - 1] += 1.0;
+                }
+                if q != GND {
+                    a[(q - 1) * n + r] -= 1.0;
+                    a[r * n + q - 1] -= 1.0;
+                }
+            }
+            Elem::OpAmp { out, row, .. } => {
+                let r = nn + row;
+                a[(out - 1) * n + r] += 1.0;
+                a[r * n + out - 1] += 1.0;
+            }
+            Elem::C { .. } | Elem::I { .. } | Elem::D { .. } => {}
+        }
     }
 }
 

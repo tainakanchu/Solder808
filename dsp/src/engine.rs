@@ -323,6 +323,66 @@ mod instruments {
         }
     }
 
+    /// A unit change on a silent machine makes no sound, and the first hit
+    /// after it sounds like a hit on a machine built as that unit (the tom
+    /// channels' standing-bias operating point used to keep the old unit's
+    /// value until the first note had rung out). Every other voice rests at
+    /// 0 V on every node, so only the toms carry a DC point to re-settle.
+    #[test]
+    fn first_hit_after_a_unit_change_matches_a_fresh_unit() {
+        let rms = |e: &mut Engine| {
+            let mut s = 0.0f64;
+            let n = (0.3 * SR) as usize / BLOCK;
+            for _ in 0..n {
+                e.process(BLOCK);
+                s += e.out.iter().map(|y| (*y as f64).powi(2)).sum::<f64>();
+            }
+            (s / (n * BLOCK) as f64).sqrt()
+        };
+        for u in [
+            Unit {
+                seed: 0,
+                age_years: 0.0,
+                temp_c: 0.0,
+            },
+            Unit {
+                seed: 9,
+                age_years: 40.0,
+                temp_c: 45.0,
+            },
+        ] {
+            for (slot, v, sw) in CASES {
+                let slot = Slot::from_u32(slot).unwrap();
+                let mut a = Engine::new(SR);
+                a.set_switch(v, sw);
+                a.trigger(slot, 0.5);
+                for _ in 0..(SR as usize * 4 / BLOCK) {
+                    a.process(BLOCK);
+                }
+                assert!(!a.any_active());
+                a.set_unit(u);
+                for _ in 0..(SR as usize / 2 / BLOCK) {
+                    a.process(BLOCK);
+                    assert!(a.out.iter().all(|y| *y == 0.0), "{slot:?} sw {sw}");
+                }
+                a.trigger(slot, 0.5);
+                let mut b = Engine::new(SR);
+                b.set_unit(u);
+                b.set_switch(v, sw);
+                b.trigger(slot, 0.5);
+                let db = 20.0 * (rms(&mut a) / rms(&mut b)).log10();
+                // Noise and the free-running oscillators differ between the
+                // two runs; the clap's few bursts of filtered noise vary most.
+                let tol = if slot == Slot::Cp && sw == 0 {
+                    2.5
+                } else {
+                    1.0
+                };
+                assert!(db.abs() < tol, "{slot:?} sw {sw} {u:?}: {db} dB");
+            }
+        }
+    }
+
     /// The low-rank Newton (factored nominal matrix + Woodbury) must agree
     /// with assembling and densely solving the full matrix, on every voice.
     #[test]
