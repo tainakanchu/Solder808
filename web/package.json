@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "wasm": "cd ../dsp && cargo build --release --lib --target wasm32-unknown-unknown && wasm-opt -O3 target/wasm32-unknown-unknown/release/solder808.wasm -o ../web/src/assets/solder808.wasm",
+    "wasm": "cd ../dsp && cargo build --release --lib --target wasm32-unknown-unknown && mkdir -p ../web/src/assets && wasm-opt -O3 target/wasm32-unknown-unknown/release/solder808.wasm -o ../web/src/assets/solder808.wasm",
     "dev": "pnpm wasm && vite",
     "build": "pnpm wasm && tsc -b && vite build",
     "typecheck": "tsc -b",
