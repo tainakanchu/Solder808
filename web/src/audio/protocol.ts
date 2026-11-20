@@ -1,7 +1,11 @@
-export const VOICES = ['BD', 'SD', 'HH', 'CP', 'CB'] as const
+/** Engine voices (knob `voice`, part-table index). LT/MT/HT switch to congas, RS to claves, CP to maracas. */
+export const VOICES = ['BD', 'SD', 'HH', 'CP', 'CB', 'LT', 'MT', 'HT', 'RS', 'CY'] as const
 /** Part-table index of the shared circuitry (supply, accent line, mixer). */
 export const COMMON = VOICES.length
-export const SLOTS = ['BD', 'SD', 'CH', 'OH', 'CP', 'CB'] as const
+/** Trigger slots, also the sequencer rows. */
+export const SLOTS = ['BD', 'SD', 'CH', 'OH', 'CP', 'CB', 'LT', 'MT', 'HT', 'RS', 'CY'] as const
+/** Voice that a trigger slot plays (CH and OH share the hi-hat). */
+export const slotVoice = (slot: number) => (slot <= 1 ? slot : slot <= 3 ? 2 : slot - 1)
 /** Steps per bar; patterns are one or two bars long. */
 export const STEPS = 16
 export const MAX_STEPS = 32
@@ -24,6 +28,8 @@ export type SyncMode = 'internal' | 'midi'
 export type ToWorklet =
   | { type: 'trigger'; slot: number; accent: number }
   | { type: 'knob'; voice: number; id: number; value: number }
+  /** Sound switch (CP/MA, tom/conga, RS/CL): 0 = first sound, 1 = alternate; applies from the next trigger. */
+  | { type: 'switch'; voice: number; value: number }
   | { type: 'unit'; seed: number; age: number; temp: number }
   | { type: 'part'; voice: number; index: number; scale: number }
   | { type: 'master'; value: number }

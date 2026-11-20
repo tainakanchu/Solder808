@@ -1,4 +1,5 @@
 import {
+  COMMON,
   SLOTS,
   VOICES,
   type FromWorklet,
@@ -17,6 +18,8 @@ type Exports = {
   engine_process(e: number, frames: number): void
   engine_trigger(e: number, slot: number, accent: number): void
   engine_set_knob(e: number, voice: number, id: number, value: number): void
+  /** Missing in engines built before the tom/conga, RS/CL and CP/MA switches. */
+  engine_set_switch?(e: number, voice: number, value: number): void
   engine_set_master(e: number, value: number): void
   engine_set_accent(e: number, value: number): void
   engine_set_unit(e: number, seed: number, age: number, temp: number): void
@@ -31,6 +34,9 @@ type Exports = {
 }
 
 const SLOT_COUNT = SLOTS.length
+// Engines without engine_set_switch have only BD SD HH CP CB, with the shared
+// circuitry at part-table index 5.
+const LEGACY_VOICES = 5
 const NORMAL = 0.35
 // AudioWorkletGlobalScope often lacks `performance`; Date.now() is only
 // millisecond-accurate, fine for the average but not for one 2.7 ms block.
@@ -86,6 +92,17 @@ class Solder808Processor extends AudioWorkletProcessor {
     this.e = this.x.engine_new(sampleRate)
   }
 
+  private get legacy() {
+    return typeof this.x.engine_set_switch !== 'function'
+  }
+
+  /** Engine part-table index for a UI voice, or −1 when this engine lacks it. */
+  private partVoice(v: number) {
+    if (!this.legacy) return v
+    if (v === COMMON) return LEGACY_VOICES
+    return v < LEGACY_VOICES ? v : -1
+  }
+
   private send(msg: FromWorklet) {
     this.port.postMessage(msg)
   }
@@ -99,14 +116,19 @@ class Solder808Processor extends AudioWorkletProcessor {
       case 'knob':
         x.engine_set_knob(e, m.voice, m.id, m.value)
         break
+      case 'switch':
+        if (typeof x.engine_set_switch === 'function') x.engine_set_switch(e, m.voice, m.value)
+        break
       case 'unit':
         x.engine_set_unit(e, m.seed >>> 0, m.age, m.temp)
         this.sendParts()
         break
-      case 'part':
-        x.engine_set_part_scale(e, m.voice, m.index, m.scale)
+      case 'part': {
+        const v = this.partVoice(m.voice)
+        if (v >= 0) x.engine_set_part_scale(e, v, m.index, m.scale)
         this.sendParts()
         break
+      }
       case 'master':
         x.engine_set_master(e, m.value)
         break
@@ -200,9 +222,10 @@ class Solder808Processor extends AudioWorkletProcessor {
   private sendParts() {
     const { x, e } = this
     const voices: PartInfo[][] = []
-    for (let v = 0; v <= VOICES.length; v++) {
+    for (let uv = 0; uv <= VOICES.length; uv++) {
       const parts: PartInfo[] = []
-      const n = x.engine_part_count(e, v)
+      const v = this.partVoice(uv)
+      const n = v >= 0 ? x.engine_part_count(e, v) : 0
       for (let i = 0; i < n; i++) {
         const ptr = x.engine_part_name_ptr(e, v, i)
         const len = x.engine_part_name_len(e, v, i)

@@ -1,48 +1,45 @@
 import { useCallback, useEffect, useRef, useState } from 'preact/hooks'
 import { startEngine, type AudioEngine, type LatencyMode } from './audio/engine'
-import { COMMON, SLOTS, STEPS, VOICES, type PartInfo, type ToWorklet } from './audio/protocol'
+import { COMMON, STEPS, VOICES, slotVoice, type PartInfo, type ToWorklet } from './audio/protocol'
 import { midiFrame, MIDI_MARGIN_MS, parseRealtime } from './audio/midi'
 import { Knob } from './components/Knob'
 import { PartsTable } from './components/PartsTable'
-import { arrange, copyBar1ToBar2, emptyPattern, parsePattern, patternToText, type Pattern } from './music/pattern'
+import { StepGrid } from './components/StepGrid'
+import { SwitchToggle } from './components/SwitchToggle'
+import {
+  CHANNELS,
+  completeKnobs,
+  defaultKnobs,
+  EXTRA_SLOTS,
+  KNOBS,
+  soundOf,
+  SWITCH_SLOTS,
+  TUNING_IDS,
+  type KnobDef,
+} from './music/channels'
+import {
+  arrange,
+  copyBar1ToBar2,
+  emptyPattern,
+  parsePattern,
+  patternToText,
+  usesExtra,
+  type Pattern,
+} from './music/pattern'
 import { PRESETS, presetPattern, type Preset } from './music/presets'
 import { decodeShare, encodeShare } from './music/share'
 import { DEFAULT_UNIT, drawUnit, type UnitState } from './music/units'
 import './App.css'
 
-type KnobDef = { id: number; label: string; init: number }
+/** Keys per slot, along the home row: A S D F G H for the original six, then J K L ; ' for LT MT HT RS CY. */
+const SLOT_KEYS = ['a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', ';', "'"]
+const KEY_LABELS = SLOT_KEYS.map((k) => k.toUpperCase())
+// Physical positions for the punctuation keys, which differ by layout (JIS has : where US has ').
+const CODE_SLOTS: Record<string, number> = { Semicolon: 9, Quote: 10 }
 
-const KNOBS: KnobDef[][] = [
-  [
-    { id: 0, label: 'Level', init: 0.8 },
-    { id: 2, label: 'Tone', init: 0.5 },
-    { id: 3, label: 'Decay', init: 0.6 },
-    { id: 1, label: 'Tune trim', init: 0.5 },
-  ],
-  [
-    { id: 0, label: 'Level', init: 0.8 },
-    { id: 1, label: 'Tone', init: 0.5 },
-    { id: 2, label: 'Snappy', init: 0.6 },
-  ],
-  [
-    { id: 0, label: 'Level', init: 0.8 },
-    { id: 1, label: 'OH Decay', init: 0.4 },
-  ],
-  [
-    { id: 0, label: 'Level', init: 0.8 },
-    { id: 1, label: 'Tail', init: 0.4 },
-  ],
-  [
-    { id: 0, label: 'Level', init: 0.7 },
-    { id: 1, label: 'Decay', init: 0.4 },
-  ],
-]
-
-const VOICE_NAMES = ['バスドラム', 'スネア', 'ハイハット', 'クラップ', 'カウベル']
-const SLOT_NAMES = ['バスドラム', 'スネア', '閉じハット', '開きハット', 'クラップ', 'カウベル']
-const SLOT_KEYS = ['a', 's', 'd', 'f', 'g', 'h']
-
-const defaultKnobs = () => KNOBS.map((vs) => vs.map((k) => k.init))
+/** Engine voice → the slot whose name and switch its knob card shows (HH shows as CH/OH). */
+const VOICE_SLOT = VOICES.map((_, v) => (v <= 2 ? v : v + 1))
+const VOICE_TITLE = ['バスドラム', 'スネア', 'ハイハット']
 
 function knobsFor(preset: Preset): number[][] {
   const ks = defaultKnobs()
@@ -54,6 +51,21 @@ function knobsFor(preset: Preset): number[][] {
 }
 
 const shared = decodeShare(window.location.hash)
+const sharedPattern = shared && parsePattern(shared.rows, shared.sw, shared.length)
+
+const EXTRA_KEY = 'solder808.extraRows'
+function savedExtraOpen(): boolean {
+  try {
+    return localStorage.getItem(EXTRA_KEY) === 'open'
+  } catch {
+    return false
+  }
+}
+
+/** First added channel the pattern plays, for the knob card to show. */
+function firstExtra(p: Pattern) {
+  return EXTRA_SLOTS.find((s) => p.vel[s].slice(0, p.length).some((v) => v > 0)) ?? EXTRA_SLOTS[0]
+}
 
 const LATENCY_KEY = 'solder808.latency'
 function savedLatency(): LatencyMode {
@@ -80,13 +92,16 @@ export default function App() {
   const [error, setError] = useState('')
   const [presetId, setPresetId] = useState<string | null>(shared?.preset ?? null)
   const [variant, setVariant] = useState(shared?.variant ?? 0)
-  const [pattern, setPattern] = useState<Pattern>(() =>
-    shared ? parsePattern(shared.rows) : presetPattern(PRESETS[0]),
-  )
+  const [pattern, setPattern] = useState<Pattern>(() => sharedPattern ?? presetPattern(PRESETS[0]))
   const [bpm, setBpm] = useState(shared?.bpm ?? PRESETS[0].bpm)
   const [swing, setSwing] = useState(shared?.swing ?? PRESETS[0].swing)
   const [unit, setUnit] = useState<UnitState>(shared?.unit ?? DEFAULT_UNIT)
-  const [knobs, setKnobs] = useState<number[][]>(() => shared?.knobs ?? defaultKnobs())
+  const [knobs, setKnobs] = useState<number[][]>(() => (shared ? completeKnobs(shared.knobs) : defaultKnobs()))
+  // The added rows (LT MT HT RS CY) fold away; they open by themselves when the pattern uses them.
+  const [extraOpen, setExtraOpen] = useState(
+    () => savedExtraOpen() || (sharedPattern ? usesExtra(sharedPattern) : false),
+  )
+  const [knobSlot, setKnobSlot] = useState(() => firstExtra(sharedPattern ?? presetPattern(PRESETS[0])))
   const [master, setMaster] = useState(0.8)
   const [accent, setAccent] = useState(shared?.accent ?? 0.8)
   const [playing, setPlaying] = useState(false)
@@ -161,10 +176,36 @@ export default function App() {
     }
   }
 
+  /** Show the added rows when a newly loaded pattern plays them. */
+  const reveal = (p: Pattern) => {
+    if (usesExtra(p)) setExtraOpen(true)
+    setKnobSlot(firstExtra(p))
+  }
+
+  const toggleExtra = () =>
+    setExtraOpen((open) => {
+      try {
+        localStorage.setItem(EXTRA_KEY, open ? 'closed' : 'open')
+      } catch {
+        // Without storage the choice lasts until reload.
+      }
+      return !open
+    })
+
+  // Editing or arranging that brings in an added row unfolds the group too.
+  const extraUsed = usesExtra(pattern)
+  const prevExtraUsedRef = useRef(extraUsed)
+  useEffect(() => {
+    if (extraUsed && !prevExtraUsedRef.current) setExtraOpen(true)
+    prevExtraUsedRef.current = extraUsed
+  }, [extraUsed])
+
   const loadPreset = (p: Preset) => {
+    const pat = presetPattern(p)
     setPresetId(p.id)
     setVariant(0)
-    setPattern(presetPattern(p))
+    setPattern(pat)
+    reveal(pat)
     setBpm(p.bpm)
     setSwing(p.swing)
     setKnobs(knobsFor(p))
@@ -184,6 +225,7 @@ export default function App() {
     setVariant(0)
     setPattern(emptyPattern())
     setKnobs(defaultKnobs())
+    setKnobSlot(EXTRA_SLOTS[0])
     await ensureEngine()
   }
 
@@ -254,7 +296,18 @@ export default function App() {
   // Keep the share URL in sync with what is playing.
   useEffect(() => {
     if (status !== 'ready') return
-    const hash = `#s=${encodeShare({ preset: presetId, variant, rows: patternToText(pattern), bpm, swing, unit, knobs, accent })}`
+    const hash = `#s=${encodeShare({
+      preset: presetId,
+      variant,
+      rows: patternToText(pattern),
+      length: pattern.length,
+      sw: pattern.sw,
+      bpm,
+      swing,
+      unit,
+      knobs,
+      accent,
+    })}`
     window.history.replaceState(null, '', hash)
   }, [status, presetId, variant, pattern, bpm, swing, unit, knobs, accent])
 
@@ -267,6 +320,13 @@ export default function App() {
     knobs.forEach((vals, v) => vals.forEach((value, i) => send({ type: 'knob', voice: v, id: KNOBS[v][i].id, value })))
     send({ type: 'getParts' })
   }, [status, knobs, send, gen])
+
+  // Sound switches; a string key so cell edits do not resend them.
+  const swKey = SWITCH_SLOTS.map((s) => pattern.sw[s]).join('')
+  useEffect(() => {
+    if (status !== 'ready') return
+    SWITCH_SLOTS.forEach((s, k) => send({ type: 'switch', voice: slotVoice(s), value: Number(swKey[k]) }))
+  }, [status, swKey, send, gen])
 
   useEffect(() => {
     if (status === 'ready') send({ type: 'master', value: master })
@@ -292,8 +352,16 @@ export default function App() {
 
   useEffect(() => {
     const onKey = (ev: KeyboardEvent) => {
-      if (ev.repeat || ev.target instanceof HTMLInputElement || status !== 'ready') return
-      const slot = SLOT_KEYS.indexOf(ev.key.toLowerCase())
+      if (
+        ev.repeat ||
+        ev.target instanceof HTMLInputElement ||
+        ev.target instanceof HTMLSelectElement ||
+        status !== 'ready'
+      )
+        return
+      if (ev.ctrlKey || ev.metaKey || ev.altKey) return
+      let slot = SLOT_KEYS.indexOf(ev.key.toLowerCase())
+      if (slot < 0) slot = CODE_SLOTS[ev.code] ?? -1
       if (slot >= 0) trigger(slot, ev.shiftKey ? 1 : 0.6)
       if (ev.key === ' ') {
         ev.preventDefault()
@@ -318,8 +386,44 @@ export default function App() {
         vel[s][i] = (vel[s][i] + 1) % 3
         if (vel[s][i] === 0) rolls[s][i] = 1
       }
-      return { vel, rolls, length: p.length }
+      return { ...p, vel, rolls }
     })
+
+  const toggleSwitch = (slot: number) => setPattern((p) => ({ ...p, sw: p.sw.map((v, s) => (s === slot ? 1 - v : v)) }))
+
+  const audition = (slot: number) => {
+    trigger(slot)
+    if (EXTRA_SLOTS.includes(slot)) setKnobSlot(slot)
+  }
+
+  const knob = (v: number, k: KnobDef, extra?: { label?: string; className?: string }) => {
+    const i = KNOBS[v].indexOf(k)
+    return (
+      <Knob
+        key={k.id}
+        label={extra?.label ?? k.label}
+        className={extra?.className}
+        value={knobs[v][i]}
+        onChange={(val) => setKnob(v, i, val)}
+      />
+    )
+  }
+
+  /** Toms put the tuning of the selected sound first; the other stays reachable, dimmed. */
+  const voiceKnobs = (v: number) => {
+    const slot = VOICE_SLOT[v]
+    const ks = KNOBS[v]
+    const tom = ks.find((k) => k.id === TUNING_IDS.tom)
+    const cga = ks.find((k) => k.id === TUNING_IDS.conga)
+    if (!tom || !cga || !CHANNELS[slot].alt) return ks.map((k) => knob(v, k))
+    const conga = pattern.sw[slot] === 1
+    const [on, off] = conga ? [cga, tom] : [tom, cga]
+    return [
+      ...ks.filter((k) => k !== tom && k !== cga).map((k) => knob(v, k)),
+      knob(v, on),
+      knob(v, off, { label: `${off.label}（${conga ? 'タム' : 'コンガ'}時）`, className: 'secondary' }),
+    ]
+  }
 
   const gacha = () => setUnit(drawUnit(Math.floor(Math.random() * 1_000_000)))
 
@@ -460,59 +564,57 @@ export default function App() {
             <button onClick={() => setPattern(copyBar1ToBar2)}>1 小節目を 2 小節目に写す</button>
           )}
         </div>
-        <div className="grid">
-          {Array.from({ length: pattern.length / STEPS }, (_, bar) => (
-            <div className={`bar bar${bar + 1}`} key={bar}>
-              {pattern.length > STEPS && <div className="bar-label">{bar + 1} 小節目</div>}
-              {SLOTS.map((slot, s) => (
-                <div className="row" key={slot}>
-                  <button
-                    className={`pad ${hit === s ? 'hit' : ''}`}
-                    onPointerDown={() => trigger(s)}
-                    title={`${SLOT_NAMES[s]}（キー ${SLOT_KEYS[s].toUpperCase()}）`}
-                  >
-                    <b>{slot}</b>
-                    <span>{SLOT_NAMES[s]}</span>
-                  </button>
-                  {Array.from({ length: STEPS }, (_, k) => {
-                    const i = bar * STEPS + k
-                    const v = pattern.vel[s][i]
-                    const roll = pattern.rolls[s][i]
-                    return (
-                      <button
-                        key={i}
-                        aria-label={`${SLOT_NAMES[s]} ${bar + 1} 小節目 ${k + 1} 番目`}
-                        className={`cell c${v} ${playing && i === step ? 'now' : ''} ${k % 4 === 0 ? 'beat' : ''}`}
-                        onClick={(e) => editCell(s, i, e.shiftKey)}
-                        onContextMenu={(e) => {
-                          e.preventDefault()
-                          editCell(s, i, true)
-                        }}
-                      >
-                        {v > 0 && roll > 1 ? roll : ''}
-                      </button>
-                    )
-                  })}
-                </div>
-              ))}
-            </div>
-          ))}
-        </div>
+        <StepGrid
+          pattern={pattern}
+          step={playing ? step : -1}
+          hit={hit}
+          keys={KEY_LABELS}
+          extraOpen={extraOpen}
+          onToggleExtra={toggleExtra}
+          onEdit={editCell}
+          onTrigger={audition}
+          onSwitch={toggleSwitch}
+        />
       </section>
 
       <section className="voices">
-        {VOICES.map((name, v) => (
-          <div className="voice" key={name}>
-            <h2>
-              {name} <span>{VOICE_NAMES[v]}</span>
-            </h2>
-            <div className="knobs">
-              {KNOBS[v].map((k, i) => (
-                <Knob key={k.id} label={k.label} value={knobs[v][i]} onChange={(val) => setKnob(v, i, val)} />
-              ))}
+        {VOICES.map((code, v) => {
+          const slot = VOICE_SLOT[v]
+          if (EXTRA_SLOTS.includes(slot)) return null
+          const sound = soundOf(slot, pattern.sw)
+          return (
+            <div className="voice" key={code}>
+              <h2>
+                {v === 2 ? code : sound.code} <span>{VOICE_TITLE[v] ?? sound.name}</span>
+                <SwitchToggle slot={slot} value={pattern.sw[slot]} onToggle={() => toggleSwitch(slot)} />
+              </h2>
+              {sound !== CHANNELS[slot] && <p className="voice-note">レベルは{CHANNELS[slot].name}と共通</p>}
+              <div className="knobs">{voiceKnobs(v)}</div>
             </div>
+          )
+        })}
+        <div className="voice extra-voices">
+          <h2>タム・リム・シンバル</h2>
+          <div className="voice-tabs" role="tablist" aria-label="つまみを出す音">
+            {EXTRA_SLOTS.map((s) => (
+              <button
+                type="button"
+                key={s}
+                role="tab"
+                aria-selected={s === knobSlot}
+                className={s === knobSlot ? 'active' : ''}
+                onClick={() => setKnobSlot(s)}
+              >
+                {soundOf(s, pattern.sw).code}
+              </button>
+            ))}
           </div>
-        ))}
+          <div className="voice-sub">
+            <strong>{soundOf(knobSlot, pattern.sw).name}</strong>
+            <SwitchToggle slot={knobSlot} value={pattern.sw[knobSlot]} onToggle={() => toggleSwitch(knobSlot)} />
+          </div>
+          <div className="knobs">{voiceKnobs(slotVoice(knobSlot))}</div>
+        </div>
       </section>
 
       <details className="parts">
@@ -578,6 +680,9 @@ export default function App() {
             共通
           </button>
         </div>
+        {(parts[partsVoice]?.length ?? 0) === 0 && (
+          <p className="voice-note">この音色の部品は、音の計算エンジンが対応すると表示されます。</p>
+        )}
         <PartsTable
           parts={parts[partsVoice] ?? []}
           onScale={(index, scale) => send({ type: 'part', voice: partsVoice, index, scale })}
