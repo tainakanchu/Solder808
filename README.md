@@ -24,6 +24,7 @@ cd web && pnpm install && pnpm dev
 - `pnpm dev` / `pnpm build` は先に Rust を wasm32 向けにビルドして `web/src/assets/solder808.wasm` に置く。
 - `pnpm lint`（oxlint）、`pnpm fmt`（oxfmt）、`pnpm typecheck`。
 - `cd dsp && cargo test --release`。`engine::fuzz` はつまみ・部品・個体をランダムに変えて、出力が有限で無音時に Newton が上限に張り付かないことを確かめる。`cargo test --release long_play -- --ignored --nocapture` で PPAP を 10 分鳴らして変化を見る。
+- SNS 用の OG 画像は `web/og-image.svg` が元。直したら `cd web && nix run nixpkgs#resvg -- og-image.svg public/og.png` で PNG を作り直す。
 - `main` に push すると GitHub Actions が同じ devShell でビルドして GitHub Pages に公開する（`.github/workflows/pages.yml`）。
 - ネイティブで WAV を書き出して測る: `cd dsp && cargo run --release --bin render -- ../renders`
 
