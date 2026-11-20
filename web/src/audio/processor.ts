@@ -158,6 +158,7 @@ class Solder808Processor extends AudioWorkletProcessor {
         this.playing = m.playing
         break
       case 'oversample':
+        if (m.factor !== 1 && m.factor !== 2) break
         this.oversample = m.factor
         if (typeof x.engine_set_oversample === 'function') x.engine_set_oversample(e, m.factor)
         break

@@ -92,9 +92,21 @@ function savedQuality(): Quality {
   }
   return 'auto'
 }
-// Auto quality steps down after this many consecutive stats reports (0.5 s each) above AUTO_LOAD.
-const AUTO_LOAD = 0.8
-const AUTO_REPORTS = 4
+// Auto quality steps down when AUTO_HOT of the last AUTO_WINDOW stats reports (0.5 s each)
+// are hot: average load above AUTO_LOAD (block peaks run 1.2–2x the average, so dropouts
+// start well below 100 %), or a measured block peak above 1 where the worklet has a timer.
+const AUTO_LOAD = 0.6
+const AUTO_WINDOW = 6
+const AUTO_HOT = 3
+// Remembers an automatic step-down so slow devices start light next time.
+const AUTO_LIGHT_KEY = 'solder808.autoLight'
+function savedAutoLight(): boolean {
+  try {
+    return localStorage.getItem(AUTO_LIGHT_KEY) === '1'
+  } catch {
+    return false
+  }
+}
 // Load right after starting, a reset, a quality change or returning to the tab is not representative.
 const SETTLE_MS = 1000
 // The parts table is refreshed this long after the last knob, unit or part change.
@@ -148,8 +160,8 @@ export default function App() {
   const syncRef = useRef('internal')
   const following = syncInput !== 'internal'
   const [quality, setQuality] = useState<Quality>(savedQuality)
-  // Auto quality stepped down this session; it does not step back up on its own.
-  const [autoLight, setAutoLight] = useState(false)
+  // Auto quality stepped down (now or on an earlier visit); it does not step back up on its own.
+  const [autoLight, setAutoLight] = useState(savedAutoLight)
   const [lightNotice, setLightNotice] = useState(false)
   // The engine's oversampling as last reported: 0 = cannot switch, -1 = no report yet.
   const [oversample, setOversample] = useState(-1)
@@ -159,17 +171,17 @@ export default function App() {
   const [partEdits, setPartEdits] = useState(0)
   // Read by the worklet message handler, which is set up once.
   const liveRef = useRef({ quality, autoLight, playing: false })
-  const hotReportsRef = useRef(0)
+  const hotReportsRef = useRef<boolean[]>([])
   const settleUntilRef = useRef(0)
   const settle = () => {
     settleUntilRef.current = performance.now() + SETTLE_MS
-    hotReportsRef.current = 0
+    hotReportsRef.current = []
   }
 
   const send = useCallback((m: ToWorklet) => engineRef.current?.send(m), [])
 
   /** Auto quality: step down to 1x once the load stays above AUTO_LOAD while playing. */
-  const watchLoad = (load: number, engineFactor: number) => {
+  const watchLoad = (load: number, peakLoad: number, engineFactor: number) => {
     const live = liveRef.current
     const counting =
       live.quality === 'auto' &&
@@ -178,9 +190,19 @@ export default function App() {
       live.playing &&
       document.visibilityState === 'visible' &&
       performance.now() >= settleUntilRef.current
-    hotReportsRef.current = counting && load > AUTO_LOAD ? hotReportsRef.current + 1 : 0
-    if (hotReportsRef.current < AUTO_REPORTS) return
-    hotReportsRef.current = 0
+    if (!counting) {
+      hotReportsRef.current = []
+      return
+    }
+    const recent = [...hotReportsRef.current, load > AUTO_LOAD || peakLoad > 1].slice(-AUTO_WINDOW)
+    hotReportsRef.current = recent
+    if (recent.filter(Boolean).length < AUTO_HOT) return
+    hotReportsRef.current = []
+    try {
+      localStorage.setItem(AUTO_LIGHT_KEY, '1')
+    } catch {
+      // Without storage the step-down lasts until reload.
+    }
     liveRef.current = { ...live, autoLight: true }
     setAutoLight(true)
     setLightNotice(true)
@@ -192,6 +214,15 @@ export default function App() {
     } catch {
       // Without storage the choice lasts until reload.
     }
+    // Choosing 自動 again gives the device a fresh chance at 2x.
+    if (q === 'auto') {
+      try {
+        localStorage.removeItem(AUTO_LIGHT_KEY)
+      } catch {
+        // Nothing stored to clear.
+      }
+      setAutoLight(false)
+    }
     setQuality(q)
     setLightNotice(false)
   }
@@ -201,6 +232,11 @@ export default function App() {
     setStatus('loading')
     try {
       const eng = await startEngine(latencyMode)
+      // The browser refused 48 kHz: at 88.2/96 kHz the 2x engine costs double, so start light.
+      if (eng.ctx.sampleRate > 48000 && liveRef.current.quality === 'auto') {
+        liveRef.current = { ...liveRef.current, autoLight: true }
+        setAutoLight(true)
+      }
       // The worklet runs ahead of the speakers by the output latency; delay
       // the step highlight by the same amount so it lines up with the sound.
       const latency = () => ((eng.ctx.baseLatency || 0) + (eng.ctx.outputLatency || 0)) * 1000
@@ -218,7 +254,7 @@ export default function App() {
           setClockBpm(m.clockBpm)
           setLatencyMs(Math.round(latency()))
           setOversample(m.oversample)
-          watchLoad(m.load, m.oversample)
+          watchLoad(m.load, m.peakLoad, m.oversample)
         }
         if (m.type === 'transport') setPlaying(m.playing)
         if (m.type === 'error') setCrash(m.message)
@@ -676,7 +712,7 @@ export default function App() {
               </button>
             ))}
           </div>
-          <span className={`meter ${load.peakLoad > 0.9 || load.load > 0.7 ? 'hot' : ''}`}>
+          <span className={`meter ${load.peakLoad > 0.9 || load.load > AUTO_LOAD ? 'hot' : ''}`}>
             負荷 {Math.round(load.load * 100)}%{loadNote && `（${loadNote}）`}
             ・遅延 {following ? latencyMs + MIDI_MARGIN_MS : latencyMs} ms
           </span>
