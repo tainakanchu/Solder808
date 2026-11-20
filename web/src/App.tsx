@@ -40,6 +40,8 @@ const CODE_SLOTS: Record<string, number> = { Semicolon: 9, Quote: 10 }
 /** Engine voice → the slot whose name and switch its knob card shows (HH shows as CH/OH). */
 const VOICE_SLOT = VOICES.map((_, v) => (v <= 2 ? v : v + 1))
 const VOICE_TITLE = ['バスドラム', 'スネア', 'ハイハット']
+/** Engine voice of the clap channel (CP/MA). */
+const CLAP_VOICE = 3
 
 function knobsFor(preset: Preset): number[][] {
   const ks = defaultKnobs()
@@ -415,6 +417,11 @@ export default function App() {
     const ks = KNOBS[v]
     const tom = ks.find((k) => k.id === TUNING_IDS.tom)
     const cga = ks.find((k) => k.id === TUNING_IDS.conga)
+    // Clap channel on maracas: Tail only shapes the clap, so keep it reachable but dimmed.
+    if (v === CLAP_VOICE && pattern.sw[slot] === 1)
+      return ks.map((k) =>
+        k.id === 0 ? knob(v, k) : knob(v, k, { label: `${k.label}（クラップ時）`, className: 'secondary' }),
+      )
     if (!tom || !cga || !CHANNELS[slot].alt) return ks.map((k) => knob(v, k))
     const conga = pattern.sw[slot] === 1
     const [on, off] = conga ? [cga, tom] : [tom, cga]
