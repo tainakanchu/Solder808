@@ -1,6 +1,7 @@
+import { MAX_STEPS, SLOTS, STEPS } from '../audio/protocol'
 import { bitsToSwitches, defaultSwitches, switchesToBits, type Switches } from './channels'
 import type { PatternText } from './pattern'
-import type { UnitState } from './units'
+import { DEFAULT_UNIT, type UnitState } from './units'
 
 export type ShareState = {
   preset: string | null
@@ -87,42 +88,73 @@ export function encodeShare(state: ShareState): string {
   return toBase64Url(JSON.stringify(wire))
 }
 
-/** Returns null when the hash is missing or not one of ours. */
+const finite = (x: unknown): x is number => typeof x === 'number' && Number.isFinite(x)
+
+/** `x` limited to the range its control offers; `fallback` when it is not a number. */
+function clamp(x: unknown, min: number, max: number, fallback: number) {
+  return finite(x) ? Math.min(max, Math.max(min, x)) : fallback
+}
+
+// Ranges of the controls these values come from (App.tsx).
+const BPM = [60, 180] as const
+const SWING = [0, 0.3] as const
+const AGE = [0, 50] as const
+const TEMP = [0, 45] as const
+
+function readUnit(u: Partial<UnitState>): UnitState {
+  return {
+    // The seed input coerces to a 32-bit integer the same way.
+    seed: finite(u.seed) ? u.seed | 0 : DEFAULT_UNIT.seed,
+    age: clamp(u.age, AGE[0], AGE[1], DEFAULT_UNIT.age),
+    temp: clamp(u.temp, TEMP[0], TEMP[1], DEFAULT_UNIT.temp),
+    name: typeof u.name === 'string' ? u.name : '共有された個体',
+  }
+}
+
+/** Knob values divided by `scale` and limited to 0–1; anything else becomes NaN, which `completeKnobs` replaces. */
+function readKnobs(knobs: unknown, scale: number): number[][] {
+  if (!Array.isArray(knobs)) return []
+  return knobs.map((vals) =>
+    Array.isArray(vals) ? vals.map((x) => (finite(x) ? Math.min(1, Math.max(0, x / scale)) : NaN)) : [],
+  )
+}
+
+/**
+ * Returns null when the hash is missing, not one of ours, or from a newer format.
+ * Values are limited to what the app's own controls produce, so a hand-made link
+ * cannot push the engine or the sequencer outside the range they are built for.
+ */
 export function decodeShare(hash: string): ShareState | null {
   const m = /^#s=([\w-]+)$/.exec(hash)
   if (!m) return null
   try {
     const s = JSON.parse(fromBase64Url(m[1])) as Wire
-    if (!Array.isArray(s.rows) || typeof s.bpm !== 'number' || !s.unit) return null
-    const rows = s.rows.map((r) => (typeof r === 'string' ? r : ''))
-    if (s.v === 2) {
+    if (!s || !Array.isArray(s.rows) || typeof s.bpm !== 'number' || !s.unit) return null
+    const v2 = s.v === 2
+    if (!v2 && s.v !== undefined) return null
+    // A row never holds more than two bars; packed v2 rows are never longer than unpacked ones.
+    const rows = s.rows
+      .slice(0, SLOTS.length)
+      .map((r) => (typeof r === 'string' ? (v2 ? unpackRow(r.slice(0, MAX_STEPS)) : r).slice(0, MAX_STEPS) : ''))
+    const common = {
+      preset: typeof s.preset === 'string' ? s.preset : null,
+      variant: finite(s.variant) ? Math.min(1e6, Math.max(0, Math.floor(s.variant))) : 0,
+      bpm: clamp(s.bpm, BPM[0], BPM[1], 120),
+      swing: clamp(s.swing, SWING[0], SWING[1], 0),
+      unit: readUnit(typeof s.unit === 'object' ? s.unit : {}),
+      accent: s.accent === undefined ? undefined : clamp(s.accent, 0, 1, 0.8),
+    }
+    if (v2) {
       return {
-        preset: s.preset,
-        variant: s.variant,
-        rows: rows.map(unpackRow),
-        length: s.len,
-        sw: bitsToSwitches(typeof s.sw === 'number' ? s.sw : 0),
-        bpm: s.bpm,
-        swing: s.swing,
-        unit: s.unit,
-        knobs: Array.isArray(s.knobs)
-          ? s.knobs.map((vals) => (Array.isArray(vals) ? vals.map((x) => (typeof x === 'number' ? x / 100 : x)) : vals))
-          : s.knobs,
-        accent: s.accent,
+        ...common,
+        rows,
+        length: s.len === STEPS || s.len === MAX_STEPS ? s.len : undefined,
+        sw: bitsToSwitches(finite(s.sw) ? s.sw : 0),
+        knobs: readKnobs(s.knobs, 100),
       }
     }
     // Version 1: the original six rows; length comes from the rows, switches are at their defaults.
-    return {
-      preset: s.preset,
-      variant: s.variant,
-      rows,
-      sw: defaultSwitches(),
-      bpm: s.bpm,
-      swing: s.swing,
-      unit: s.unit,
-      knobs: s.knobs,
-      accent: s.accent,
-    }
+    return { ...common, rows, sw: defaultSwitches(), knobs: readKnobs(s.knobs, 1) }
   } catch {
     return null
   }
