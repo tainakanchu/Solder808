@@ -66,6 +66,14 @@ function savedLatency(): LatencyMode {
   return 'interactive'
 }
 
+const footer = (
+  <footer className="site-footer">
+    <a href="https://github.com/tainakanchu/Solder808" target="_blank" rel="noopener noreferrer">
+      GitHub
+    </a>
+  </footer>
+)
+
 export default function App() {
   const engineRef = useRef<AudioEngine | null>(null)
   const [status, setStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle')
@@ -351,6 +359,7 @@ export default function App() {
         </button>
         {status === 'loading' && <p className="lead">起動中…</p>}
         {status === 'error' && <p className="error">{error}</p>}
+        {footer}
       </main>
     )
   }
@@ -574,6 +583,7 @@ export default function App() {
           onScale={(index, scale) => send({ type: 'part', voice: partsVoice, index, scale })}
         />
       </details>
+      {footer}
     </main>
   )
 }
