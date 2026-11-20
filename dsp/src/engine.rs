@@ -10,8 +10,12 @@ use crate::sd::Snare;
 use crate::tom::{TomConga, HIGH, LOW, MID};
 use crate::voice::Voice;
 
+/// Default internal oversampling factor (1 or 2, switchable at run time with
+/// [`Engine::set_oversample`]).
 pub const OVERSAMPLE: usize = 2;
 pub const BLOCK: usize = 128;
+/// Length of the fade that hides the cut when the oversampling changes (s).
+const SWITCH_FADE: f64 = 0.005;
 /// Voice (channel) indices: 0 BD, 1 SD, 2 HH, 3 CP/MA, 4 CB, 5 LT/LC,
 /// 6 MT/MC, 7 HT/HC, 8 RS/CL, 9 CY. Also the part-table index.
 pub const VOICES: usize = 10;
@@ -115,10 +119,24 @@ impl Biquad {
 pub struct Engine {
     voices: [Box<dyn Voice>; VOICES],
     metal: MetalBank,
+    sr: f64,
+    os: usize,
     isr: f64,
     common: Common,
     unit: Unit,
+    /// Decimation filter (2× only; at 1× there is nothing to decimate).
     aa: [Biquad; 2],
+    /// Knob values (ids 1..=3) and panel switches as last set, so a rebuild
+    /// for another oversampling factor can restore them.
+    knobs: [[Option<f64>; 4]; VOICES],
+    switches: [Option<u32>; VOICES],
+    /// Behavioral noise sources' gain, so their in-band level (white noise
+    /// spreads its power up to the internal Nyquist) is the same at 1× and 2×.
+    noise: f64,
+    /// Last output before master, and the fade that bridges a rebuild's cut.
+    last: f64,
+    fade: f64,
+    fade_step: f64,
     pub out: [f32; BLOCK],
     pub master: f64,
 }
@@ -126,36 +144,95 @@ pub struct Engine {
 /// Index used for the shared circuitry in part-table calls.
 pub const COMMON: usize = VOICES;
 
+fn build_voices(isr: f64) -> [Box<dyn Voice>; VOICES] {
+    [
+        Box::new(BassDrum::new(isr)),
+        Box::new(Snare::new(isr)),
+        Box::new(HiHat::new(isr)),
+        Box::new(Clap::new(isr)),
+        Box::new(Cowbell::new(isr)),
+        Box::new(TomConga::new(isr, &LOW)),
+        Box::new(TomConga::new(isr, &MID)),
+        Box::new(TomConga::new(isr, &HIGH)),
+        Box::new(RimClaves::new(isr)),
+        Box::new(Cymbal::new(isr)),
+    ]
+}
+
+fn decimator(sr: f64, isr: f64) -> [Biquad; 2] {
+    let fc = sr * 0.45;
+    [
+        Biquad::lowpass(isr, fc, 0.541_196),
+        Biquad::lowpass(isr, fc, 1.306_563),
+    ]
+}
+
 impl Engine {
     pub fn new(sample_rate: f64) -> Self {
         let isr = sample_rate * OVERSAMPLE as f64;
-        let fc = sample_rate * 0.45;
         let mut e = Self {
-            voices: [
-                Box::new(BassDrum::new(isr)),
-                Box::new(Snare::new(isr)),
-                Box::new(HiHat::new(isr)),
-                Box::new(Clap::new(isr)),
-                Box::new(Cowbell::new(isr)),
-                Box::new(TomConga::new(isr, &LOW)),
-                Box::new(TomConga::new(isr, &MID)),
-                Box::new(TomConga::new(isr, &HIGH)),
-                Box::new(RimClaves::new(isr)),
-                Box::new(Cymbal::new(isr)),
-            ],
+            voices: build_voices(isr),
             metal: MetalBank::default(),
+            sr: sample_rate,
+            os: OVERSAMPLE,
             isr,
             common: Common::new(isr),
             unit: Unit::default(),
-            aa: [
-                Biquad::lowpass(isr, fc, 0.541_196),
-                Biquad::lowpass(isr, fc, 1.306_563),
-            ],
+            aa: decimator(sample_rate, isr),
+            knobs: [[None; 4]; VOICES],
+            switches: [None; VOICES],
+            noise: 1.0,
+            last: 0.0,
+            fade: 0.0,
+            fade_step: 0.0,
             out: [0.0; BLOCK],
             master: 0.8,
         };
         e.retune_metal();
         e
+    }
+
+    /// Internal oversampling factor in use (1 or 2).
+    pub fn oversample(&self) -> usize {
+        self.os
+    }
+
+    /// Switch the internal oversampling factor (1 or 2; anything else is
+    /// ignored). Takes effect from the next `process`. Every voice is rebuilt
+    /// for the new internal rate, so pulse widths, sleep times, oscillator
+    /// increments and every circuit's time step follow it; knobs, switches,
+    /// the unit, part edits, levels, accent and master carry over. Notes still
+    /// ringing are cut, behind a short fade from the last output sample.
+    pub fn set_oversample(&mut self, factor: u32) {
+        let os = factor as usize;
+        if !(os == 1 || os == 2) || os == self.os {
+            return;
+        }
+        self.os = os;
+        self.isr = self.sr * os as f64;
+        // White noise at the internal rate: same density in the audio band.
+        self.noise = (os as f64 / OVERSAMPLE as f64).sqrt();
+        let mut voices = build_voices(self.isr);
+        for (k, v) in voices.iter_mut().enumerate() {
+            for (p, old) in v.parts_mut().iter_mut().zip(self.voices[k].parts()) {
+                p.user_scale = old.user_scale;
+            }
+            for (id, x) in self.knobs[k].iter().enumerate() {
+                if let Some(x) = *x {
+                    v.set_knob(id as u32, x);
+                }
+            }
+            if let Some(sw) = self.switches[k] {
+                v.set_switch(sw);
+            }
+            v.refresh(&self.unit);
+        }
+        self.voices = voices;
+        self.common.rebuild(self.isr, &self.unit);
+        self.aa = decimator(self.sr, self.isr);
+        self.retune_metal();
+        self.fade = self.last;
+        self.fade_step = self.last / (self.sr * SWITCH_FADE).max(1.0);
     }
 
     /// The shared oscillator bank follows the hi-hat's R/C parts.
@@ -187,6 +264,7 @@ impl Engine {
     pub fn set_switch(&mut self, voice: usize, value: u32) {
         if let Some(v) = self.voices.get_mut(voice) {
             v.set_switch(value);
+            self.switches[voice] = Some(value);
         }
     }
 
@@ -197,8 +275,12 @@ impl Engine {
         if id == 0 {
             self.common.set_level(voice, value);
         } else {
-            v.set_knob(id, value.clamp(0.0, 1.0));
+            let value = value.clamp(0.0, 1.0);
+            v.set_knob(id, value);
             v.refresh(&self.unit);
+            if let Some(k) = self.knobs[voice].get_mut(id as usize) {
+                *k = Some(value);
+            }
         }
     }
 
@@ -239,9 +321,10 @@ impl Engine {
         let frames = frames.min(BLOCK);
         for i in 0..frames {
             let mut y = 0.0;
-            for _ in 0..OVERSAMPLE {
+            for _ in 0..self.os {
                 let draw: f64 = self.voices.iter().map(|v| v.accent_draw()).sum();
                 let mut bus = self.common.bus(draw);
+                bus.noise = self.noise;
                 if self.voices[HH].active() || self.voices[CY].active() {
                     bus.metal = self.metal.tick();
                 }
@@ -257,9 +340,21 @@ impl Engine {
                 }
                 self.common.update_rail(current);
                 let s = self.common.mix(&outs, any, bus.rail);
-                let z = self.aa[0].run(s);
-                y = self.aa[1].run(z);
+                y = if self.os > 1 {
+                    let z = self.aa[0].run(s);
+                    self.aa[1].run(z)
+                } else {
+                    s
+                };
             }
+            if self.fade != 0.0 {
+                y += self.fade;
+                self.fade -= self.fade_step;
+                if self.fade * self.fade_step <= 0.0 {
+                    self.fade = 0.0;
+                }
+            }
+            self.last = y;
             // Converter-side soft limit, then master.
             self.out[i] = ((y * self.master).tanh()) as f32;
         }
@@ -424,6 +519,175 @@ mod instruments {
         assert!(diff < 1e-6, "{diff}");
     }
 
+    fn render(e: &mut Engine, secs: f64) -> Vec<f32> {
+        let mut out = Vec::new();
+        for _ in 0..(SR * secs) as usize / BLOCK {
+            e.process(BLOCK);
+            out.extend_from_slice(&e.out);
+        }
+        out
+    }
+
+    /// Switching the oversampling rebuilds every voice for the new rate but
+    /// keeps every user setting: switching to 1x and back leaves a machine
+    /// that sounds exactly like one set up from scratch.
+    #[test]
+    fn oversample_switch_keeps_every_setting() {
+        let setup = |e: &mut Engine| {
+            e.set_unit(Unit {
+                seed: 11,
+                age_years: 20.0,
+                temp_c: 35.0,
+            });
+            for (v, id, x) in [
+                (0, 1, 0.3),
+                (0, 3, 0.9),
+                (1, 0, 0.5),
+                (1, 2, 0.2),
+                (2, 1, 0.7),
+                (3, 1, 0.9),
+                (4, 1, 0.1),
+                (5, 1, 0.2),
+                (7, 2, 0.8),
+                (9, 2, 0.9),
+                (9, 1, 0.3),
+            ] {
+                e.set_knob(v, id, x);
+            }
+            e.set_part_scale(0, 0, 1.3);
+            e.set_part_scale(6, 2, 0.8);
+            e.set_part_scale(COMMON, 0, 3.0);
+            e.set_switch(5, 1);
+            e.set_switch(8, 1);
+            e.set_accent(0.4);
+            e.master = 1.1;
+        };
+        let mut a = Engine::new(SR);
+        setup(&mut a);
+        for s in 0..SLOTS {
+            a.trigger(Slot::from_u32(s).unwrap(), 1.0);
+        }
+        render(&mut a, 0.2);
+        a.set_oversample(1);
+        assert_eq!(a.oversample(), 1);
+        // Notes ringing at the switch are cut behind a fade, not a click.
+        let cut = render(&mut a, 1.0);
+        let step = cut.windows(2).fold(0f32, |m, w| m.max((w[1] - w[0]).abs()));
+        assert!(step < 0.05, "{step}");
+        assert!(!a.any_active());
+        for f in [0, 3, 4] {
+            a.set_oversample(f);
+            assert_eq!(a.oversample(), 1);
+        }
+        a.set_oversample(2);
+        let mut b = Engine::new(SR);
+        setup(&mut b);
+        for v in 0..=VOICES {
+            for (p, q) in a.parts(v).unwrap().iter().zip(b.parts(v).unwrap()) {
+                assert_eq!(p.effective, q.effective, "{v} {}", p.name);
+                assert_eq!(p.user_scale, q.user_scale, "{v} {}", p.name);
+            }
+        }
+        // The metal bank's phases run on, so compare the hi-hat and cymbal
+        // by level and everything else sample for sample.
+        let metal = [Slot::Ch, Slot::Oh, Slot::Cy];
+        for e in [&mut a, &mut b] {
+            for s in 0..SLOTS {
+                let s = Slot::from_u32(s).unwrap();
+                if !metal.contains(&s) {
+                    e.trigger(s, 0.6);
+                }
+            }
+        }
+        let (x, y) = (render(&mut a, 0.5), render(&mut b, 0.5));
+        let diff = x
+            .iter()
+            .zip(&y)
+            .fold(0f32, |m, (p, q)| m.max((p - q).abs()));
+        assert!(diff < 1e-6, "{diff}");
+        render(&mut a, 4.0);
+        render(&mut b, 4.0);
+        for e in [&mut a, &mut b] {
+            for s in metal {
+                e.trigger(s, 0.6);
+            }
+        }
+        let rms = |x: &[f32]| x.iter().map(|v| (*v as f64).powi(2)).sum::<f64>().sqrt();
+        let (x, y) = (render(&mut a, 0.5), render(&mut b, 0.5));
+        let db = 20.0 * (rms(&x) / rms(&y)).log10();
+        assert!(db.abs() < 0.5, "{db}");
+    }
+
+    /// At 1x the circuits run at the output rate: pitches and decays stay
+    /// those of 2x (only the top octave changes, as the trapezoidal rule
+    /// warps high-frequency filters more), and noise keeps its level.
+    #[test]
+    fn one_x_keeps_tunings_decays_and_levels() {
+        let hit = |os: u32, slot: u32, v: usize, sw: u32| {
+            let mut e = Engine::new(SR);
+            e.set_oversample(os);
+            e.set_switch(v, sw);
+            e.trigger(Slot::from_u32(slot).unwrap(), 0.5);
+            render(&mut e, 1.5)
+        };
+        // Frequency from upward zero crossings in [t0, t1) s.
+        let freq = |x: &[f32], t0: f64, t1: f64| {
+            let (mut first, mut last, mut n) = (0.0, 0.0, 0);
+            for i in (t0 * SR) as usize..(t1 * SR) as usize {
+                let (p, q) = (x[i - 1] as f64, x[i] as f64);
+                if p <= 0.0 && q > 0.0 {
+                    let at = i as f64 - q / (q - p);
+                    if n == 0 {
+                        first = at;
+                    }
+                    last = at;
+                    n += 1;
+                }
+            }
+            (n - 1) as f64 * SR / (last - first)
+        };
+        // Time until the 10 ms RMS stays 40 dB under its peak.
+        let decay = |x: &[f32]| {
+            let w = (SR * 0.01) as usize;
+            let e: Vec<f64> = x
+                .chunks(w)
+                .map(|c| c.iter().map(|v| (*v as f64).powi(2)).sum::<f64>())
+                .collect();
+            let pk = e.iter().fold(0.0f64, |m, v| m.max(*v));
+            let last = e.iter().rposition(|v| *v > pk * 1e-4).unwrap();
+            (last + 1) as f64 * 0.01
+        };
+        let rms = |x: &[f32]| x.iter().map(|v| (*v as f64).powi(2)).sum::<f64>().sqrt();
+        for (slot, v, sw) in CASES {
+            let (x2, x1) = (hit(2, slot, v, sw), hit(1, slot, v, sw));
+            let db = 20.0 * (rms(&x1) / rms(&x2)).log10();
+            let (d2, d1) = (decay(&x2), decay(&x1));
+            println!("slot {slot} sw {sw}: {db:+.2} dB, decay {d2} {d1}");
+            assert!(db.abs() < 1.0, "slot {slot} sw {sw}: {db} dB");
+            assert!(
+                (d1 / d2 - 1.0).abs() < 0.08,
+                "slot {slot} sw {sw}: {d2} {d1}"
+            );
+        }
+        // Pitched voices: BD, toms and congas, claves.
+        for (slot, v, sw, t0, t1) in [
+            (0, 0, 0, 0.1, 0.4),
+            (6, 5, 0, 0.1, 0.4),
+            (6, 5, 1, 0.05, 0.25),
+            (8, 7, 0, 0.1, 0.3),
+            (8, 7, 1, 0.05, 0.2),
+            (9, 8, 1, 0.005, 0.04),
+        ] {
+            let f2 = freq(&hit(2, slot, v, sw), t0, t1);
+            let f1 = freq(&hit(1, slot, v, sw), t0, t1);
+            println!("slot {slot} sw {sw}: {f2:.2} Hz vs {f1:.2} Hz");
+            assert!(
+                (f1 / f2 - 1.0).abs() < 0.01,
+                "slot {slot} sw {sw}: {f2} {f1}"
+            );
+        }
+    }
+
     #[test]
     fn hihat_and_cymbal_share_the_metal_bank() {
         let mut e = Engine::new(SR);
@@ -460,8 +724,8 @@ mod fuzz {
         }
     }
 
-    /// Random UI-reachable settings and hits must never produce non-finite
-    /// output. Run with `FUZZ_CASES=500 cargo test fuzz -- --nocapture` for more.
+    /// Random UI-reachable settings (oversampling included) and hits must
+    /// never produce non-finite output. Run with `FUZZ_CASES=500 cargo test fuzz -- --nocapture` for more.
     #[test]
     fn random_settings_stay_finite() {
         let cases: u64 = std::env::var("FUZZ_CASES")
@@ -472,6 +736,10 @@ mod fuzz {
         for case in 1..=cases {
             let mut r = Rng(case.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
             let mut e = Engine::new(sr);
+            // Half the cases start at 1×; all may switch while playing.
+            if case % 2 == 1 {
+                e.set_oversample(1);
+            }
             let mut log = Vec::new();
             for blk in 0..(sr as usize * 3 / BLOCK) {
                 if r.f() < 0.05 {
@@ -509,7 +777,15 @@ mod fuzz {
                             e.set_switch(v, x);
                             log.push(format!("switch {v} {x}"));
                         }
-                        _ => {}
+                        _ => {
+                            // 0 and 3 must be ignored.
+                            let f = r.u(4) as u32;
+                            let before = e.oversample();
+                            e.set_oversample(f);
+                            let want = if f == 1 || f == 2 { f as usize } else { before };
+                            assert_eq!(e.oversample(), want);
+                            log.push(format!("oversample {f}"));
+                        }
                     }
                 }
                 if blk % 4 == 0 {

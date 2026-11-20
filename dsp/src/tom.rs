@@ -363,7 +363,7 @@ impl Voice for TomConga {
             // after it while the gain moves slowly next to the filter's
             // sub-ms time constants, and it lets the filter go quiet.
             let g = vca_gain(self.nz.v(self.nenv));
-            let n = self.noise.tick();
+            let n = self.noise.tick() * bus.noise;
             self.nz.rail = bus.rail;
             self.nz.set_voltage(self.ntrig, p);
             self.nz.set_voltage(self.nsrc, n * g * NOISE_DRIVE);

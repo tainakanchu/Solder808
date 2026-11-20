@@ -213,7 +213,7 @@ impl Voice for Snare {
         }
         let v = self.pulse.next(bus);
         self.c.rail = bus.rail;
-        let n = self.noise();
+        let n = self.noise() * bus.noise;
         self.c.set_voltage(self.trig, v);
         // Gate the noise generator with the envelope so the voice can sleep.
         let gate = self.c.v(self.env).clamp(0.0, 1.0);

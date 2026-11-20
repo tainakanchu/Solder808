@@ -210,7 +210,7 @@ impl Clap {
     fn tick_maracas(&mut self, bus: &Bus) -> f64 {
         let p = self.ma_pulse.next(bus);
         let g = vca_gain(self.ma.v(self.ma_env));
-        let n = self.ma_noise.tick();
+        let n = self.ma_noise.tick() * bus.noise;
         self.ma.rail = bus.rail;
         self.ma.set_voltage(self.ma_trig, p);
         // VCA ahead of the linear high-pass, as on the clap.
@@ -241,7 +241,7 @@ impl Clap {
         }
         let g = vca_gain(self.c.v(self.env_burst)) * 6.0 + vca_gain(self.c.v(self.env_tail)) * 3.0;
         // VCA ahead of the filter keeps the noise silent between hits.
-        let n = self.noise.tick();
+        let n = self.noise.tick() * bus.noise;
         self.c.set_voltage(self.src, n * g * 0.25);
         self.c.set_voltage(self.trig_burst, burst);
         self.c.set_voltage(self.trig_tail, tail);

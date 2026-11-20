@@ -12,6 +12,10 @@ pub struct Bus {
     /// source the hi-hat and cymbal both filter). Only computed while one of
     /// those two voices is awake; 0 otherwise.
     pub metal: f64,
+    /// Gain for behavioral white-noise sources, which keeps their level in
+    /// the audio band independent of the internal sample rate (1 at the
+    /// default oversampling).
+    pub noise: f64,
 }
 
 impl Default for Bus {
@@ -20,6 +24,7 @@ impl Default for Bus {
             accent: 1.0,
             rail: 1.0,
             metal: 0.0,
+            noise: 1.0,
         }
     }
 }
