@@ -127,10 +127,9 @@ pub struct TomConga {
     p_stand: usize,
     vr_tom: f64,
     vr_conga: f64,
-    /// Nodes watched by the sleeper: ones that rest at exactly 0 V (the diode
-    /// bias holds the ground leg, the bridge middle and the pitch envelope at
-    /// a standing DC level, so they never go quiet).
-    watch: [Node; 3],
+    /// Op-amp output (tests).
+    #[cfg(test)]
+    o: Node,
     /// Noise filter nodes (to tell when the burst has died away).
     filt: [Node; 3],
     out: Node,
@@ -232,13 +231,17 @@ impl TomConga {
         pm.r(&mut nb, nout, GND, "R13 noise HPF", 10e3);
         pm.c(&mut nb, nout, GND, "C11 noise LPF", K::Ceramic, 22e-9);
 
+        // The noise circuit is not coasted: `nz_live` stops it, the same way
+        // whether or not the body sleeps.
+        let c = cb.build(sr);
+        let sleep = Sleeper::new(sr, &[&c]);
         let mut t = Self {
-            c: cb.build(sr),
+            c,
             nz: nb.build(sr),
             pm,
             pulse: Pulse::new(sr),
-            sleep: Sleeper::new(sr),
-            noise: Noise(spec.noise_seed),
+            sleep,
+            noise: Noise::new(spec.noise_seed),
             salt: spec.salt,
             trig,
             ntrig,
@@ -261,7 +264,8 @@ impl TomConga {
             p_stand,
             vr_tom: spec.vr_tom,
             vr_conga: spec.vr_conga,
-            watch: [o, out, inv],
+            #[cfg(test)]
+            o,
             filt: [n1, n2, nout],
             out,
             nenv,
@@ -325,6 +329,7 @@ impl Voice for TomConga {
         // temperature. Solve it directly (trigger line at rest): a silent
         // voice is put on it, a ringing one is shifted by the change so it
         // keeps ringing around the new point with no thump.
+        self.sleep.restore(&mut [&mut self.c]);
         self.c.set_voltage(self.trig, 0.0);
         self.set_bias(self.c.rail);
         self.c.mark_dc();
@@ -335,18 +340,20 @@ impl Voice for TomConga {
         self.c.set_resistance(self.e_rf, self.pm.eff(self.p_rf));
         self.apply_mode();
         self.set_bias(self.c.rail);
-        self.c.settle_dc(!self.sleep.awake);
+        self.c.settle_dc(self.sleep.resting());
+        self.sleep.resume(&[&self.c]);
     }
     fn trigger(&mut self, accent: f64, _variant: u32) {
         if self.pending != self.conga {
             self.conga = self.pending;
             self.apply_mode();
         }
+        self.noise.strike();
         self.pulse.fire(accent);
-        self.sleep.wake();
+        self.sleep.wake(&mut [&mut self.c]);
     }
     fn tick(&mut self, bus: &Bus) -> f64 {
-        if !self.sleep.awake {
+        if !self.sleep.awake() {
             return 0.0;
         }
         let p = self.pulse.next(bus);
@@ -375,21 +382,23 @@ impl Voice for TomConga {
                 .fold(0.0f64, |m, &k| m.max(self.nz.v(k).abs()));
             self.nz_live = p > 0.0 || self.nz.v(self.nenv) > 0.05 || filt > 1e-6;
         }
-        let level = self.watch.iter().fold(
-            if self.nz_live { self.nz.energy() } else { 0.0 },
-            |m, &n| m.max(self.c.v(n).abs()),
-        );
-        self.sleep.observe_level(level);
-        self.c.v(self.out) + noise * NOISE_MIX
+        self.sleep.hear(self.c.v(self.out) + noise * NOISE_MIX)
     }
     fn active(&self) -> bool {
-        self.sleep.awake
+        self.sleep.awake()
+    }
+    fn housekeep(&mut self) {
+        let idle = !self.pulse.busy() && !self.nz_live;
+        self.sleep.housekeep(&[&self.c], idle);
+    }
+    fn set_quiet(&mut self, volts: f64) {
+        self.sleep.set_threshold(volts);
     }
     fn accent_draw(&self) -> f64 {
         self.pulse.draw()
     }
     fn supply_current(&self) -> f64 {
-        crate::voice::supply_draw(self.sleep.awake, &[&self.c, &self.nz])
+        crate::voice::supply_draw(self.sleep.awake(), &[&self.c, &self.nz])
     }
 }
 
@@ -435,7 +444,7 @@ mod tests {
                 let mut peak = 0.0f64;
                 for _ in 0..(SR * 0.3) as usize {
                     t.tick(&Bus::default());
-                    peak = peak.max(t.c.v(t.watch[0]).abs());
+                    peak = peak.max(t.c.v(t.o).abs());
                 }
                 let salt = spec.salt;
                 assert!(peak > 2.0 && peak < 8.5, "{salt} conga {conga}: {peak}");
@@ -494,7 +503,10 @@ mod tests {
     fn body_peak(t: &mut TomConga, secs: f64) -> f64 {
         t.trigger(0.5, 0);
         let mut peak = 0.0f64;
-        for _ in 0..(secs * SR) as usize {
+        for i in 0..(secs * SR) as usize {
+            if i % crate::voice::book_every(SR) == 0 {
+                t.housekeep();
+            }
             t.tick(&Bus::default());
             peak = peak.max(t.c.v(t.out).abs());
         }

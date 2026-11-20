@@ -67,7 +67,12 @@ impl MetalBank {
 }
 
 pub struct HiHat {
+    /// Band-pass on the metal source, joined to the rest only through the
+    /// behavioral VCA. Left as it is while asleep.
+    f: Circuit,
+    /// Envelopes.
     a: Circuit,
+    /// Output high-pass after the VCA.
     b: Circuit,
     parts: Vec<Part>,
     pulse_ch: Pulse,
@@ -80,6 +85,7 @@ pub struct HiHat {
     choke: ElemId,
     choke_left: u32,
     vca_in: ElemId,
+    map_f: Vec<(ElemId, usize, bool)>,
     map_a: Vec<(ElemId, usize, bool)>,
     map_b: Vec<(ElemId, usize, bool)>,
     diodes: Vec<(ElemId, usize)>,
@@ -109,24 +115,28 @@ impl HiHat {
             part(&mut parts, C_NAMES[i], K::FilmCap, OSC_C);
         }
 
-        // Circuit A: band-pass on the metallic sum + envelopes.
+        // Circuit F: band-pass on the metallic sum.
+        let mut fb = CircuitBuilder::new();
+        let mut map_f = Vec::new();
+        let n_metal = fb.node();
+        let n_a = fb.node();
+        let n_inv = fb.node();
+        let n_bp = fb.node();
+        let metal = fb.vsource(n_metal, GND);
+        let e = fb.resistor(n_metal, n_a, 1.0);
+        map_f.push((e, part(&mut parts, "R7 BPF in", K::Carbon, 5.6e3), false));
+        let e = fb.capacitor(n_a, n_inv, 1.0);
+        map_f.push((e, part(&mut parts, "C7 BPF", K::Ceramic, 1e-9), true));
+        let e = fb.capacitor(n_a, n_bp, 1.0);
+        map_f.push((e, part(&mut parts, "C8 BPF", K::Ceramic, 1e-9), true));
+        let e = fb.resistor(n_bp, n_inv, 1.0);
+        map_f.push((e, part(&mut parts, "R8 BPF fb", K::Carbon, 91e3), false));
+        fb.opamp(GND, n_inv, n_bp);
+
+        // Circuit A: envelopes.
         let mut cb = CircuitBuilder::new();
         let mut map_a = Vec::new();
         let mut diodes = Vec::new();
-        let n_metal = cb.node();
-        let n_a = cb.node();
-        let n_inv = cb.node();
-        let n_bp = cb.node();
-        let metal = cb.vsource(n_metal, GND);
-        let e = cb.resistor(n_metal, n_a, 1.0);
-        map_a.push((e, part(&mut parts, "R7 BPF in", K::Carbon, 5.6e3), false));
-        let e = cb.capacitor(n_a, n_inv, 1.0);
-        map_a.push((e, part(&mut parts, "C7 BPF", K::Ceramic, 1e-9), true));
-        let e = cb.capacitor(n_a, n_bp, 1.0);
-        map_a.push((e, part(&mut parts, "C8 BPF", K::Ceramic, 1e-9), true));
-        let e = cb.resistor(n_bp, n_inv, 1.0);
-        map_a.push((e, part(&mut parts, "R8 BPF fb", K::Carbon, 91e3), false));
-        cb.opamp(GND, n_inv, n_bp);
 
         let mut env = |cb: &mut CircuitBuilder,
                        parts: &mut Vec<Part>,
@@ -175,13 +185,16 @@ impl HiHat {
         let e = cb2.resistor(n_out, GND, 1.0);
         map_b.push((e, part(&mut parts, "R13 HPF", K::Carbon, 2.2e3), false));
 
+        let (a, b) = (cb.build(sr), cb2.build(sr));
+        let sleep = Sleeper::new(sr, &[&a, &b]);
         let mut hh = Self {
-            a: cb.build(sr),
-            b: cb2.build(sr),
+            f: fb.build(sr),
+            a,
+            b,
             parts,
             pulse_ch: Pulse::new(sr),
             pulse_oh: Pulse::new(sr),
-            sleep: Sleeper::new(sr),
+            sleep,
             sr,
             metal,
             trig_ch,
@@ -189,6 +202,7 @@ impl HiHat {
             choke,
             choke_left: 0,
             vca_in,
+            map_f,
             map_a,
             map_b,
             diodes,
@@ -229,6 +243,15 @@ impl Voice for HiHat {
         let ri = self.r_decay_index();
         self.parts[ri + 1].nominal = VR_DECAY_MAX * audio_taper(self.knob_decay);
         apply_unit(&mut self.parts, unit, VOICE_ID);
+        self.sleep.restore(&mut [&mut self.a, &mut self.b]);
+        for &(id, pi, cap) in &self.map_f {
+            let v = self.parts[pi].effective;
+            if cap {
+                self.f.set_capacitance(id, v);
+            } else {
+                self.f.set_resistance(id, v);
+            }
+        }
         for &(id, pi, cap) in &self.map_a {
             let v = self.parts[pi].effective;
             if cap {
@@ -252,9 +275,14 @@ impl Voice for HiHat {
             let p = &self.parts[pi];
             self.a.set_diode(id, p.effective, p.n, vt);
         }
+        self.sleep.resume(&[&self.a, &self.b]);
     }
 
     fn trigger(&mut self, accent: f64, variant: u32) {
+        #[cfg(test)]
+        if crate::voice::testing::restart_sources() {
+            self.f.rest();
+        }
         if variant == 0 {
             self.pulse_ch.fire(accent);
             self.choke_left = (self.sr * 3e-3) as u32;
@@ -262,11 +290,11 @@ impl Voice for HiHat {
         } else {
             self.pulse_oh.fire(accent);
         }
-        self.sleep.wake();
+        self.sleep.wake(&mut [&mut self.a, &mut self.b]);
     }
 
     fn tick(&mut self, bus: &Bus) -> f64 {
-        if !self.sleep.awake {
+        if !self.sleep.awake() {
             return 0.0;
         }
         if self.choke_left > 0 {
@@ -277,9 +305,11 @@ impl Voice for HiHat {
         }
         let ch = self.pulse_ch.next(bus);
         let oh = self.pulse_oh.next(bus);
+        self.f.rail = bus.rail;
         self.a.rail = bus.rail;
         self.b.rail = bus.rail;
-        self.a.set_voltage(self.metal, bus.metal * 0.5);
+        self.f.set_voltage(self.metal, bus.metal * 0.5);
+        self.f.step();
         self.a.set_voltage(self.trig_ch, ch);
         self.a.set_voltage(self.trig_oh, oh);
         self.a.step();
@@ -289,26 +319,29 @@ impl Voice for HiHat {
             x * x * 4.0
         };
         let gain = g(self.a.v(self.env_ch)) + g(self.a.v(self.env_oh));
-        self.b.set_voltage(self.vca_in, self.a.v(self.bp) * gain);
+        self.b.set_voltage(self.vca_in, self.f.v(self.bp) * gain);
         self.b.step();
-        // Only the envelopes and output decide sleep; the oscillators never stop.
-        let env = self.a.v(self.env_ch).abs().max(self.a.v(self.env_oh).abs());
-        if env < 0.21 && self.b.energy() < 1e-4 {
-            self.sleep.observe(&[&self.b]);
-        } else {
-            self.sleep.wake();
-        }
-        self.b.v(self.out)
+        self.sleep.hear(self.b.v(self.out))
     }
 
     fn active(&self) -> bool {
-        self.sleep.awake
+        self.sleep.awake()
+    }
+
+    fn housekeep(&mut self) {
+        // Past the pulses the envelopes only fall, so the output only fades.
+        let idle = !self.pulse_ch.busy() && !self.pulse_oh.busy();
+        self.sleep.housekeep(&[&self.a, &self.b], idle);
+    }
+
+    fn set_quiet(&mut self, volts: f64) {
+        self.sleep.set_threshold(volts);
     }
 
     fn accent_draw(&self) -> f64 {
         self.pulse_ch.draw() + self.pulse_oh.draw()
     }
     fn supply_current(&self) -> f64 {
-        crate::voice::supply_draw(self.sleep.awake, &[&self.a, &self.b])
+        crate::voice::supply_draw(self.sleep.awake(), &[&self.a, &self.b])
     }
 }

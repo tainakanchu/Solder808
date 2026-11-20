@@ -5,6 +5,7 @@
 //! The resonators, filters and envelope are solved as a circuit. The noise
 //! source and the VCA gain law are behavioral.
 
+use crate::blocks::Noise;
 use crate::circuit::{Circuit, CircuitBuilder, ElemId, Node, GND};
 use crate::parts::{apply_unit, Part, PartKind as K, Unit};
 use crate::voice::{Bus, Pulse, Sleeper, Voice};
@@ -27,7 +28,7 @@ pub struct Snare {
     env: Node,
     knob_tone: f64,
     knob_snappy: f64,
-    rng: u32,
+    noise: Noise,
 }
 
 impl Snare {
@@ -137,11 +138,13 @@ impl Snare {
             false,
         ));
 
+        let c = cb.build(sr);
+        let sleep = Sleeper::new(sr, &[&c]);
         let mut sd = Self {
-            c: cb.build(sr),
+            c,
             parts,
             pulse: Pulse::new(sr),
-            sleep: Sleeper::new(sr),
+            sleep,
             trig,
             noise_src,
             map,
@@ -152,20 +155,10 @@ impl Snare {
             env: n_env,
             knob_tone: 0.5,
             knob_snappy: 0.6,
-            rng: 0x1234_5678,
+            noise: Noise::new(0x1234_5678),
         };
         sd.refresh(&Unit::default());
         sd
-    }
-
-    fn noise(&mut self) -> f64 {
-        // xorshift32 white noise in [-1, 1).
-        let mut x = self.rng;
-        x ^= x << 13;
-        x ^= x >> 17;
-        x ^= x << 5;
-        self.rng = x;
-        (x as f64 / u32::MAX as f64) * 2.0 - 1.0
     }
 }
 
@@ -187,6 +180,7 @@ impl Voice for Snare {
 
     fn refresh(&mut self, unit: &Unit) {
         apply_unit(&mut self.parts, unit, VOICE_ID);
+        self.sleep.restore(&mut [&mut self.c]);
         for &(id, pi, is_cap) in &self.map {
             let v = self.parts[pi].effective;
             if is_cap {
@@ -200,43 +194,54 @@ impl Voice for Snare {
             let p = &self.parts[pi];
             self.c.set_diode(id, p.effective, p.n, vt);
         }
+        self.sleep.resume(&[&self.c]);
     }
 
     fn trigger(&mut self, accent: f64, _variant: u32) {
+        self.noise.strike();
         self.pulse.fire(accent);
-        self.sleep.wake();
+        self.sleep.wake(&mut [&mut self.c]);
     }
 
     fn tick(&mut self, bus: &Bus) -> f64 {
-        if !self.sleep.awake {
+        if !self.sleep.awake() {
             return 0.0;
         }
         let v = self.pulse.next(bus);
         self.c.rail = bus.rail;
-        let n = self.noise() * bus.noise;
+        let n = self.noise.tick() * bus.noise;
         self.c.set_voltage(self.trig, v);
         // Gate the noise generator with the envelope so the voice can sleep.
         let gate = self.c.v(self.env).clamp(0.0, 1.0);
         self.c.set_voltage(self.noise_src, n * 2.0 * gate);
         self.c.step();
-        self.sleep.observe(&[&self.c]);
         let body = (1.0 - self.knob_tone) * self.c.v(self.out_a)
             + (0.4 + self.knob_tone) * self.c.v(self.out_b);
         // Behavioral VCA: exponential-ish gain from the envelope voltage.
         let env = (self.c.v(self.env) - 0.2).max(0.0) / 8.0;
         let vca = env * env * 6.0;
-        body * 0.6 + self.c.v(self.noise_out) * vca * self.knob_snappy * 3.0
+        self.sleep
+            .hear(body * 0.6 + self.c.v(self.noise_out) * vca * self.knob_snappy * 3.0)
     }
 
     fn active(&self) -> bool {
-        self.sleep.awake
+        self.sleep.awake()
+    }
+
+    fn housekeep(&mut self) {
+        // Past the pulse the envelope only falls, so the output only fades.
+        self.sleep.housekeep(&[&self.c], !self.pulse.busy());
+    }
+
+    fn set_quiet(&mut self, volts: f64) {
+        self.sleep.set_threshold(volts);
     }
 
     fn accent_draw(&self) -> f64 {
         self.pulse.draw()
     }
     fn supply_current(&self) -> f64 {
-        crate::voice::supply_draw(self.sleep.awake, &[&self.c])
+        crate::voice::supply_draw(self.sleep.awake(), &[&self.c])
     }
 }
 

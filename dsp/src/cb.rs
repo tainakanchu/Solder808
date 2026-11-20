@@ -15,7 +15,11 @@ const OSC_K: f64 = 1.4;
 const VR_DECAY_MAX: f64 = 470e3;
 
 pub struct Cowbell {
+    /// Envelopes, VCA and output (coasted while asleep).
     c: Circuit,
+    /// Band-pass on the oscillators, joined to `c` only through the
+    /// behavioral VCA. Left as it is while asleep.
+    f: Circuit,
     pm: PartMap,
     sleep: Sleeper,
     osc: [Square; 2],
@@ -42,12 +46,13 @@ impl Cowbell {
             pm.add(names[0], K::Carbon, 1.0 / (OSC_K * f * OSC_C));
             pm.add(names[1], K::FilmCap, OSC_C);
         }
-        let mut cb = CircuitBuilder::new();
-        let n_src = cb.node();
-        let src = cb.vsource(n_src, GND);
+        pm.target = 1;
+        let mut fb = CircuitBuilder::new();
+        let n_src = fb.node();
+        let src = fb.vsource(n_src, GND);
         // ~2.6 kHz band-pass, Q ≈ 1.5.
         let bp = mfb_bandpass(
-            &mut cb,
+            &mut fb,
             &mut pm,
             n_src,
             ["R3 BPF in", "C3 BPF", "C4 BPF", "R4 BPF fb"],
@@ -55,6 +60,8 @@ impl Cowbell {
             10e-9,
             37e3,
         );
+        pm.target = 0;
+        let mut cb = CircuitBuilder::new();
         let (trig_fast, env_fast) = peak_env(
             &mut cb,
             &mut pm,
@@ -79,10 +86,13 @@ impl Cowbell {
         pm.c(&mut cb, n_vca, out, "C7 output", K::Electrolytic, 1e-6);
         pm.r(&mut cb, out, GND, "R9 load", 10e3);
 
+        let c = cb.build(sr);
+        let sleep = Sleeper::new(sr, &[&c]);
         let mut cbell = Self {
-            c: cb.build(sr),
+            c,
+            f: fb.build(sr),
             pm,
-            sleep: Sleeper::new(sr),
+            sleep,
             osc: [
                 Square::default(),
                 Square {
@@ -123,7 +133,9 @@ impl Voice for Cowbell {
     }
     fn refresh(&mut self, unit: &Unit) {
         self.pm.parts[self.vr_decay].nominal = VR_DECAY_MAX * self.knob_decay;
-        self.pm.refresh(&mut self.c, unit, VOICE_ID);
+        self.sleep.restore(&mut [&mut self.c]);
+        self.pm
+            .refresh_all(&mut [&mut self.c, &mut self.f], unit, VOICE_ID);
         for i in 0..2 {
             let r = self.pm.parts[2 * i].effective;
             let c = self.pm.parts[2 * i + 1].effective;
@@ -131,40 +143,50 @@ impl Voice for Cowbell {
         }
         let r = self.pm.parts[self.vr_decay - 1].effective + self.pm.parts[self.vr_decay].effective;
         self.c.set_resistance(self.r_slow, r);
+        self.sleep.resume(&[&self.c]);
     }
     fn trigger(&mut self, accent: f64, _variant: u32) {
+        #[cfg(test)]
+        if crate::voice::testing::restart_sources() {
+            self.osc[0].phase = 0.0;
+            self.osc[1].phase = 0.37;
+            self.f.rest();
+        }
         self.pulse.fire(accent);
-        self.sleep.wake();
+        self.sleep.wake(&mut [&mut self.c]);
     }
     fn tick(&mut self, bus: &Bus) -> f64 {
-        if !self.sleep.awake {
+        if !self.sleep.awake() {
             return 0.0;
         }
         let tone = self.osc[0].tick() + self.osc[1].tick();
         let p = self.pulse.next(bus);
         self.c.rail = bus.rail;
-        self.c.set_voltage(self.src, tone * 0.5);
+        self.f.rail = bus.rail;
+        self.f.set_voltage(self.src, tone * 0.5);
         self.c.set_voltage(self.trig_fast, p);
         self.c.set_voltage(self.trig_slow, p * 0.6);
         let g = vca_gain(self.c.v(self.env_fast)) * 5.0 + vca_gain(self.c.v(self.env_slow)) * 9.0;
-        self.c.set_voltage(self.vca, self.c.v(self.bp) * g);
+        self.c.set_voltage(self.vca, self.f.v(self.bp) * g);
+        self.f.step();
         self.c.step();
-        let env = self.c.v(self.env_fast).max(self.c.v(self.env_slow));
-        if env > 0.21 {
-            self.sleep.wake();
-        } else {
-            self.sleep.observe_level(self.c.v(self.out).abs());
-        }
-        self.c.v(self.out)
+        self.sleep.hear(self.c.v(self.out))
     }
     fn active(&self) -> bool {
-        self.sleep.awake
+        self.sleep.awake()
+    }
+    fn housekeep(&mut self) {
+        // Past the pulse the envelopes only fall, so the output only fades.
+        self.sleep.housekeep(&[&self.c], !self.pulse.busy());
+    }
+    fn set_quiet(&mut self, volts: f64) {
+        self.sleep.set_threshold(volts);
     }
 
     fn accent_draw(&self) -> f64 {
         self.pulse.draw()
     }
     fn supply_current(&self) -> f64 {
-        crate::voice::supply_draw(self.sleep.awake, &[&self.c])
+        crate::voice::supply_draw(self.sleep.awake(), &[&self.c])
     }
 }

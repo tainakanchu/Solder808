@@ -8,7 +8,7 @@ use crate::parts::{Part, Unit};
 use crate::rs::RimClaves;
 use crate::sd::Snare;
 use crate::tom::{TomConga, HIGH, LOW, MID};
-use crate::voice::Voice;
+use crate::voice::{book_every, Voice};
 
 /// Default internal oversampling factor (1 or 2, switchable at run time with
 /// [`Engine::set_oversample`]).
@@ -24,6 +24,9 @@ const CY: usize = 9;
 
 /// Output trim per voice so circuit volts land near ±1 (BD stays the loudest).
 const TRIM: [f64; VOICES] = [0.85, 0.1, 0.3, 0.7, 0.18, 0.15, 0.15, 0.15, 0.38, 0.43];
+/// A voice may sleep once its output stays below this at the engine output
+/// (after trim, at full level and master): −90 dBFS.
+const QUIET: f64 = 3.16e-5;
 
 /// Trigger slots exposed to the UI.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -137,6 +140,11 @@ pub struct Engine {
     last: f64,
     fade: f64,
     fade_step: f64,
+    /// Internal samples until the next housekeeping, its period, and the
+    /// supply draw it sampled (held in between).
+    book: usize,
+    every: usize,
+    current: f64,
     pub out: [f32; BLOCK],
     pub master: f64,
 }
@@ -145,7 +153,7 @@ pub struct Engine {
 pub const COMMON: usize = VOICES;
 
 fn build_voices(isr: f64) -> [Box<dyn Voice>; VOICES] {
-    [
+    let mut v: [Box<dyn Voice>; VOICES] = [
         Box::new(BassDrum::new(isr)),
         Box::new(Snare::new(isr)),
         Box::new(HiHat::new(isr)),
@@ -156,7 +164,11 @@ fn build_voices(isr: f64) -> [Box<dyn Voice>; VOICES] {
         Box::new(TomConga::new(isr, &HIGH)),
         Box::new(RimClaves::new(isr)),
         Box::new(Cymbal::new(isr)),
-    ]
+    ];
+    for (k, v) in v.iter_mut().enumerate() {
+        v.set_quiet(QUIET / TRIM[k]);
+    }
+    v
 }
 
 fn decimator(sr: f64, isr: f64) -> [Biquad; 2] {
@@ -185,6 +197,9 @@ impl Engine {
             last: 0.0,
             fade: 0.0,
             fade_step: 0.0,
+            book: 0,
+            every: book_every(isr),
+            current: 0.0,
             out: [0.0; BLOCK],
             master: 0.8,
         };
@@ -228,6 +243,8 @@ impl Engine {
             v.refresh(&self.unit);
         }
         self.voices = voices;
+        self.every = book_every(self.isr);
+        self.book = 0;
         self.common.rebuild(self.isr, &self.unit);
         self.aa = decimator(self.sr, self.isr);
         self.retune_metal();
@@ -256,6 +273,11 @@ impl Engine {
 
     pub fn trigger(&mut self, slot: Slot, accent: f64) {
         let (v, variant) = slot.target();
+        #[cfg(test)]
+        if (v == HH || v == CY) && crate::voice::testing::restart_sources() {
+            self.metal = MetalBank::default();
+            self.retune_metal();
+        }
         self.voices[v].trigger(accent, variant);
     }
 
@@ -322,6 +344,15 @@ impl Engine {
         for i in 0..frames {
             let mut y = 0.0;
             for _ in 0..self.os {
+                if self.book == 0 {
+                    self.book = self.every;
+                    self.current = 0.0;
+                    for v in &mut self.voices {
+                        v.housekeep();
+                        self.current += v.supply_current();
+                    }
+                }
+                self.book -= 1;
                 let draw: f64 = self.voices.iter().map(|v| v.accent_draw()).sum();
                 let mut bus = self.common.bus(draw);
                 bus.noise = self.noise;
@@ -329,16 +360,14 @@ impl Engine {
                     bus.metal = self.metal.tick();
                 }
                 let mut outs = [0.0; VOICES];
-                let mut current = 0.0;
                 let mut any = false;
                 for (k, v) in self.voices.iter_mut().enumerate() {
                     if v.active() {
                         outs[k] = v.tick(&bus) * TRIM[k];
-                        current += v.supply_current();
                         any = true;
                     }
                 }
-                self.common.update_rail(current);
+                self.common.update_rail(self.current);
                 let s = self.common.mix(&outs, any, bus.rail);
                 y = if self.os > 1 {
                     let z = self.aa[0].run(s);
@@ -674,6 +703,8 @@ mod instruments {
             (0, 0, 0, 0.1, 0.4),
             (6, 5, 0, 0.1, 0.4),
             (6, 5, 1, 0.05, 0.25),
+            (7, 6, 0, 0.1, 0.4),
+            (7, 6, 1, 0.05, 0.25),
             (8, 7, 0, 0.1, 0.3),
             (8, 7, 1, 0.05, 0.2),
             (9, 8, 1, 0.005, 0.04),
@@ -686,6 +717,60 @@ mod instruments {
                 "slot {slot} sw {sw}: {f2} {f1}"
             );
         }
+    }
+
+    /// Sleeping is invisible: a voice only sleeps once its output is far
+    /// below audibility (the output while it falls asleep and coasts stays
+    /// within −80 dBFS of a machine whose voices never sleep), and a note
+    /// struck after it went to sleep, or while it is still coasting, matches
+    /// the same note on that machine (noise and oscillators restarted on
+    /// each trigger in both). At both oversampling factors.
+    #[test]
+    fn sleeping_never_changes_the_next_hit() {
+        use crate::voice::testing::{NEVER_SLEEP, RESTART_SOURCES};
+        RESTART_SOURCES.with(|f| f.set(true));
+        let (mut worst_hit, mut worst_gap) = (0.0f64, 0.0f64);
+        for os in [2, 1] {
+            for (slot, v, sw) in CASES {
+                let s = Slot::from_u32(slot).unwrap();
+                for gap in [0.6, 1.2, 2.5, 4.5] {
+                    let mut slept = None;
+                    let mut runs = [(Vec::new(), Vec::new()), (Vec::new(), Vec::new())];
+                    for (k, run) in runs.iter_mut().enumerate() {
+                        let mut e = Engine::new(SR);
+                        e.set_oversample(os);
+                        NEVER_SLEEP.with(|f| f.set(k == 1));
+                        e.set_switch(v, sw);
+                        e.trigger(s, 0.5);
+                        for i in 0..(gap * SR) as usize / BLOCK {
+                            e.process(BLOCK);
+                            run.0.extend_from_slice(&e.out);
+                            if k == 0 && slept.is_none() && !e.any_active() {
+                                slept = Some((i * BLOCK) as f64 / SR);
+                            }
+                        }
+                        e.trigger(s, 0.5);
+                        run.1 = render(&mut e, 0.5);
+                    }
+                    NEVER_SLEEP.with(|f| f.set(false));
+                    let max_diff = |p: &[f32], q: &[f32]| {
+                        p.iter().zip(q).fold(0f32, |m, (p, q)| m.max((p - q).abs())) as f64
+                    };
+                    let peak = runs[1].1.iter().fold(0f32, |m, y| m.max(y.abs())) as f64;
+                    let hit = max_diff(&runs[0].1, &runs[1].1) / peak;
+                    let tail = max_diff(&runs[0].0, &runs[1].0);
+                    worst_hit = worst_hit.max(hit);
+                    worst_gap = worst_gap.max(tail);
+                    println!(
+                        "{os}x slot {slot} sw {sw} gap {gap}: slept at {slept:.2?} s, \
+                         tail off by {tail:.1e}, next hit off by {hit:.2e}"
+                    );
+                }
+            }
+        }
+        RESTART_SOURCES.with(|f| f.set(false));
+        assert!(worst_hit < 1e-4, "{worst_hit}");
+        assert!(worst_gap < 1e-4, "{worst_gap}");
     }
 
     #[test]
