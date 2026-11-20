@@ -1,0 +1,26 @@
+{
+  "name": "solder808-web",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "wasm": "cd ../dsp && cargo build --release --lib --target wasm32-unknown-unknown && wasm-opt -O3 target/wasm32-unknown-unknown/release/solder808.wasm -o ../web/src/assets/solder808.wasm",
+    "dev": "pnpm wasm && vite",
+    "build": "pnpm wasm && tsc -b && vite build",
+    "typecheck": "tsc -b",
+    "lint": "oxlint",
+    "fmt": "oxfmt",
+    "fmt:check": "oxfmt --check",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "preact": "^11.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.2",
+    "oxfmt": "^0.79.0",
+    "oxlint": "^1.90.0",
+    "typescript": "~7.0.2",
+    "vite": "^8.3.6"
+  }
+}
