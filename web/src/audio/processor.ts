@@ -1,4 +1,13 @@
-import { SLOTS, VOICES, type FromWorklet, type PartInfo, type Rolls, type ToWorklet, type Velocities } from './protocol'
+import {
+  SLOTS,
+  VOICES,
+  type FromWorklet,
+  type SyncMode,
+  type PartInfo,
+  type Rolls,
+  type ToWorklet,
+  type Velocities,
+} from './protocol'
 
 type Exports = {
   memory: WebAssembly.Memory
@@ -49,6 +58,12 @@ class Solder808Processor extends AudioWorkletProcessor {
   private rollNext = new Float64Array(SLOT_COUNT)
   private rollGap = new Float64Array(SLOT_COUNT)
   private rollAccent = new Float64Array(SLOT_COUNT)
+  // MIDI clock following: 24 ticks per beat, so a sixteenth every 6 ticks.
+  private sync: SyncMode = 'internal'
+  private tick = -1
+  private lastTickFrame = -1
+  private tickLen = 0
+  private queue: { frame: number; step: number }[] = []
 
   constructor(options: { processorOptions: { wasm: ArrayBuffer } }) {
     super()
@@ -109,7 +124,55 @@ class Solder808Processor extends AudioWorkletProcessor {
       case 'getParts':
         this.sendParts()
         break
+      case 'sync':
+        this.sync = m.mode
+        this.queue = []
+        this.tickLen = 0
+        this.lastTickFrame = -1
+        this.untilStep = 0
+        break
+      case 'spp':
+        this.tick = m.pos * 6 - 1
+        break
+      case 'midi':
+        this.onMidi(m.kind, m.frame)
+        break
     }
+  }
+
+  private onMidi(kind: 'clock' | 'start' | 'continue' | 'stop', frame: number) {
+    if (kind === 'start') {
+      // The first clock after Start is the downbeat.
+      this.tick = -1
+      this.queue = []
+      this.rollLeft.fill(0)
+      this.playing = true
+    } else if (kind === 'continue') {
+      this.playing = true
+    } else if (kind === 'stop') {
+      this.playing = false
+      this.queue = []
+      this.rollLeft.fill(0)
+    } else {
+      if (this.lastTickFrame >= 0) {
+        const dt = frame - this.lastTickFrame
+        if (dt > 0 && dt < sampleRate * 0.25) this.tickLen = this.tickLen ? this.tickLen * 0.9 + dt * 0.1 : dt
+      }
+      this.lastTickFrame = frame
+      if (!this.playing) return
+      this.tick += 1
+      if (this.tick % 6 !== 0) return
+      const step = (this.tick / 6) % this.length
+      // Swing delays the off-beat sixteenths, as in the internal sequencer.
+      const at = frame + (step % 2 === 1 ? this.swing * this.tickLen * 6 : 0)
+      this.queue.push({ frame: at, step })
+    }
+  }
+
+  /** Samples per sixteenth at the current tempo (internal or measured from clock). */
+  private stepLen() {
+    if (this.sync === 'midi' && this.tickLen > 0) return this.tickLen * 6
+    return (sampleRate * 60) / this.bpm / 4
   }
 
   private sendParts() {
@@ -138,7 +201,7 @@ class Solder808Processor extends AudioWorkletProcessor {
   }
 
   private fireStep() {
-    const base = (sampleRate * 60) / this.bpm / 4
+    const base = this.stepLen()
     // Swing lengthens even steps and shortens odd ones.
     const len = base * (this.step % 2 === 0 ? 1 + this.swing : 1 - this.swing)
     for (let s = 0; s < SLOT_COUNT; s++) {
@@ -184,7 +247,8 @@ class Solder808Processor extends AudioWorkletProcessor {
     this.audioMs += budget
     this.peakLoad = Math.max(this.peakLoad, busy / budget)
     if (this.audioMs >= 500) {
-      this.send({ type: 'stats', load: this.busyMs / this.audioMs, peakLoad: HIRES ? this.peakLoad : -1 })
+      const clockBpm = this.sync === 'midi' && this.tickLen > 0 ? (sampleRate * 60) / (this.tickLen * 24) : -1
+      this.send({ type: 'stats', load: this.busyMs / this.audioMs, peakLoad: HIRES ? this.peakLoad : -1, clockBpm })
       this.busyMs = 0
       this.audioMs = 0
       this.peakLoad = 0
@@ -212,7 +276,17 @@ class Solder808Processor extends AudioWorkletProcessor {
     const t0 = now()
     let done = 0
     while (done < frames) {
-      if (this.playing && this.untilStep < 1) this.fireStep()
+      if (this.sync === 'midi') {
+        // Steps come from the clock queue; a late tick fires at once.
+        const head = this.queue[0]
+        this.untilStep = head ? head.frame - (currentFrame + done) : Infinity
+        if (this.playing && head && this.untilStep < 1) {
+          this.queue.shift()
+          this.step = head.step % this.length
+          this.fireStep()
+          continue
+        }
+      } else if (this.playing && this.untilStep < 1) this.fireStep()
       let n = Math.min(frames - done, this.block)
       if (this.playing) n = Math.min(n, Math.max(1, Math.ceil(this.nextEvent())))
       x.engine_process(e, n)

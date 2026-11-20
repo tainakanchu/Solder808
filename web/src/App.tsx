@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'preact/hooks'
 import { startEngine, type AudioEngine, type LatencyMode } from './audio/engine'
 import { COMMON, SLOTS, STEPS, VOICES, type PartInfo, type ToWorklet } from './audio/protocol'
+import { midiFrame, MIDI_MARGIN_MS, parseRealtime } from './audio/midi'
 import { Knob } from './components/Knob'
 import { PartsTable } from './components/PartsTable'
 import { arrange, copyBar1ToBar2, emptyPattern, parsePattern, patternToText, type Pattern } from './music/pattern'
@@ -94,6 +95,12 @@ export default function App() {
   const [ctxState, setCtxState] = useState<AudioContextState | 'stalled'>('running')
   const [crash, setCrash] = useState('')
   const partsRef = useRef<PartInfo[][]>([])
+  // 'internal' or the id of the MIDI input whose clock is followed.
+  const [syncInput, setSyncInput] = useState('internal')
+  const [midiInputs, setMidiInputs] = useState<{ id: string; name: string }[] | null>(null)
+  const [clockBpm, setClockBpm] = useState(-1)
+  const midiRef = useRef<MIDIAccess | null>(null)
+  const following = syncInput !== 'internal'
 
   const send = useCallback((m: ToWorklet) => engineRef.current?.send(m), [])
 
@@ -116,6 +123,7 @@ export default function App() {
         if (m.type === 'stats') {
           lastStats = performance.now()
           setLoad({ load: m.load, peakLoad: m.peakLoad })
+          setClockBpm(m.clockBpm)
           setLatencyMs(Math.round(latency()))
         }
         if (m.type === 'error') setCrash(m.message)
@@ -176,6 +184,51 @@ export default function App() {
     if (base) setPattern((p) => arrange({ ...presetPattern(base), length: p.length }, next))
     else setPattern((p) => arrange(p, next))
   }
+
+  const onMidiMessage = useCallback((ev: MIDIMessageEvent) => {
+    const eng = engineRef.current
+    const msg = ev.data && parseRealtime(ev.data)
+    if (!eng || !msg) return
+    if (msg.type === 'spp') {
+      eng.send(msg)
+      return
+    }
+    eng.send({ type: 'midi', kind: msg.kind, frame: midiFrame(eng.ctx, ev.timeStamp) })
+    if (msg.kind === 'start' || msg.kind === 'continue') setPlaying(true)
+    if (msg.kind === 'stop') setPlaying(false)
+  }, [])
+
+  const followInput = useCallback(
+    (id: string) => {
+      midiRef.current?.inputs.forEach((input) => {
+        input.onmidimessage = input.id === id ? onMidiMessage : null
+      })
+      setSyncInput(id)
+    },
+    [onMidiMessage],
+  )
+
+  const onSyncChange = async (value: string) => {
+    if (value !== 'request') {
+      followInput(value)
+      return
+    }
+    try {
+      const access = await navigator.requestMIDIAccess()
+      midiRef.current = access
+      const list = () => [...access.inputs.values()].map((i) => ({ id: i.id, name: i.name ?? i.id }))
+      access.onstatechange = () => setMidiInputs(list())
+      const inputs = list()
+      setMidiInputs(inputs)
+      if (inputs.length > 0) followInput(inputs[0].id)
+    } catch {
+      setMidiInputs([])
+    }
+  }
+
+  useEffect(() => {
+    if (status === 'ready') send({ type: 'sync', mode: following ? 'midi' : 'internal' })
+  }, [status, following, send, gen])
 
   // Keep the share URL in sync with what is playing.
   useEffect(() => {
@@ -313,7 +366,32 @@ export default function App() {
             {playing ? '■ 止める' : '▶ 再生'}
           </button>
           <button onClick={onArrange}>アレンジ{variant > 0 ? ` #${variant}` : ''}</button>
-          <Knob label="テンポ" value={bpm} min={60} max={180} step={1} format={(v) => `${v} BPM`} onChange={setBpm} />
+          {following ? (
+            <span className="clock-bpm">テンポ {clockBpm > 0 ? `${clockBpm.toFixed(1)} BPM` : '-'}</span>
+          ) : (
+            <Knob label="テンポ" value={bpm} min={60} max={180} step={1} format={(v) => `${v} BPM`} onChange={setBpm} />
+          )}
+          {'requestMIDIAccess' in navigator && (
+            <label className="sync">
+              同期
+              <select value={syncInput} onChange={(e) => void onSyncChange(e.currentTarget.value)}>
+                <option value="internal">内部</option>
+                {midiInputs === null ? (
+                  <option value="request">MIDI クロック</option>
+                ) : midiInputs.length === 0 ? (
+                  <option value="none" disabled>
+                    MIDI 入力なし
+                  </option>
+                ) : (
+                  midiInputs.map((i) => (
+                    <option key={i.id} value={i.id}>
+                      {i.name}
+                    </option>
+                  ))
+                )}
+              </select>
+            </label>
+          )}
           <Knob
             label="跳ね"
             value={swing}
@@ -338,7 +416,7 @@ export default function App() {
           </div>
           <span className={`meter ${load.peakLoad > 0.9 || load.load > 0.7 ? 'hot' : ''}`}>
             負荷 {Math.round(load.load * 100)}%{load.peakLoad >= 0 && `（瞬間 ${Math.round(load.peakLoad * 100)}%）`}
-            ・遅延 {latencyMs} ms
+            ・遅延 {following ? latencyMs + MIDI_MARGIN_MS : latencyMs} ms
           </span>
           {status === 'ready' && ctxState !== 'running' && (
             <span className="stopped">

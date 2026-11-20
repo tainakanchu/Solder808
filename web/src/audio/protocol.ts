@@ -19,6 +19,8 @@ export type PartInfo = {
   scale: number
 }
 
+export type SyncMode = 'internal' | 'midi'
+
 export type ToWorklet =
   | { type: 'trigger'; slot: number; accent: number }
   | { type: 'knob'; voice: number; id: number; value: number }
@@ -28,12 +30,21 @@ export type ToWorklet =
   | { type: 'accent'; value: number }
   | { type: 'seq'; vel: Velocities; rolls: Rolls; length: number; bpm: number; swing: number; playing: boolean }
   | { type: 'getParts' }
+  /** Follow the internal tempo or incoming MIDI clock. */
+  | { type: 'sync'; mode: SyncMode }
+  /** MIDI realtime message; `frame` is when it should take effect on the context timeline. */
+  | { type: 'midi'; kind: 'clock' | 'start' | 'continue' | 'stop'; frame: number }
+  /** MIDI song position pointer, in sixteenth notes. */
+  | { type: 'spp'; pos: number }
 
 export type FromWorklet =
   | { type: 'ready' }
   | { type: 'step'; index: number }
-  /** Share of the real-time budget spent rendering, 0..1+ (above 1 = dropouts); peakLoad −1 = unknown. */
-  | { type: 'stats'; load: number; peakLoad: number }
+  /**
+   * Share of the real-time budget spent rendering, 0..1+ (above 1 = dropouts); peakLoad −1 = unknown.
+   * clockBpm is the tempo measured from MIDI clock, −1 when not following it.
+   */
+  | { type: 'stats'; load: number; peakLoad: number; clockBpm: number }
   | { type: 'parts'; voices: PartInfo[][] }
   | { type: 'error'; message: string }
   /** The engine was rebuilt after an error; settings must be sent again. */

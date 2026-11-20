@@ -455,3 +455,16 @@ td.scale button {
   color: var(--accent);
   font-size: 0.85rem;
 }
+
+.clock-bpm {
+  font-family: var(--mono);
+  font-size: 12px;
+  min-width: 120px;
+}
+
+.sync {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+}
