@@ -878,14 +878,27 @@ fn lin_opamp(raw: f64, vd: &mut f64, gain: f64, vsat: f64) -> (bool, f64, f64) {
 
 /// The diode's linearized current at `v` is within tolerance of the exact one.
 fn diode_settled(v: f64, is: f64, nvt: f64, vd: f64, (id, gd): (f64, f64)) -> bool {
+    // Taylor remainder first: the tangent's error is ½·I''(ξ)·d² with
+    // I'' = I'·e^((ξ−vd)/nVt)/nVt ≤ gd/nVt while the voltage has not risen,
+    // which settles most samples without an exp().
+    let d = v - vd;
+    if d <= 0.0 && 0.5 * gd / nvt * d * d <= TOL_I {
+        return true;
+    }
     let exact = is * ((v / nvt).min(80.0).exp() - 1.0);
-    (exact - (id + gd * (v - vd))).abs() <= TOL_I + 1e-6 * exact.abs()
+    (exact - (id + gd * d)).abs() <= TOL_I + 1e-6 * exact.abs()
 }
 
 /// The op-amp's linearized output at `v` is within tolerance of the curve.
 fn opamp_settled(v: f64, gain: f64, vsat: f64, vd: f64, (t, k): (f64, f64)) -> bool {
+    // Taylor remainder first: |d²/dv² vsat·tanh(g·v/vsat)| ≤ 0.77·g²/vsat,
+    // so the tangent is within 0.385·g²/vsat·d²; small steps need no tanh().
+    let d = v - vd;
+    if 0.385 * gain * gain / vsat * d * d <= TOL_OPAMP_V {
+        return true;
+    }
     let exact = vsat * (gain * v / vsat).tanh();
-    (exact - (vsat * t + k * (v - vd))).abs() <= TOL_OPAMP_V
+    (exact - (vsat * t + k * d)).abs() <= TOL_OPAMP_V
 }
 
 #[inline]
