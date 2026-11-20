@@ -9,7 +9,8 @@ export type Pattern = { vel: Velocities; rolls: Rolls; length: number; sw: Switc
 
 /**
  * One string per slot (BD SD CH OH CP CB LT MT HT RS CY), 16 or 32 chars each:
- * `.` off, `x` on, `X` accent, `2`–`4` on with a roll of that many hits.
+ * `.` off, `x` on, `X` accent, `2`–`4` on with a roll of that many hits,
+ * `5`–`7` accented with a roll of 2–4 hits (added later, so older texts never contain them).
  */
 export type PatternText = string[]
 
@@ -19,8 +20,16 @@ export type PatternText = string[]
  */
 export type PatternRows = Partial<Record<string, string>>
 
-const cellVel = (c: string) => (c === 'X' ? 2 : c === '.' ? 0 : 1)
-const cellRoll = (c: string) => (c >= '2' && c <= '4' ? Number(c) : 1)
+/** Accented rolls are written 3 above the plain roll digit. */
+const ACCENT_ROLL = 3
+const cellVel = (c: string) => (c === 'X' || (c >= '5' && c <= '7') ? 2 : c === '.' ? 0 : 1)
+const cellRoll = (c: string) => (c >= '2' && c <= '4' ? Number(c) : c >= '5' && c <= '7' ? Number(c) - ACCENT_ROLL : 1)
+
+function cellText(vel: number, roll: number): string {
+  if (vel === 0) return '.'
+  if (roll > 1) return String(vel === 2 ? roll + ACCENT_ROLL : roll)
+  return vel === 2 ? 'X' : 'x'
+}
 
 /**
  * A one-bar text is repeated into bar 2 so switching to two bars starts sensibly.
@@ -69,7 +78,7 @@ export function patternToText(p: Pattern): PatternText {
   return p.vel.map((row, s) =>
     row
       .slice(0, p.length)
-      .map((v, i) => (v === 0 ? '.' : v === 2 ? 'X' : p.rolls[s][i] > 1 ? String(p.rolls[s][i]) : 'x'))
+      .map((v, i) => cellText(v, p.rolls[s][i]))
       .join(''),
   )
 }
