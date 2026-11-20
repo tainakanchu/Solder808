@@ -323,6 +323,47 @@ mod instruments {
         }
     }
 
+    /// The low-rank Newton (factored nominal matrix + Woodbury) must agree
+    /// with assembling and densely solving the full matrix, on every voice.
+    #[test]
+    fn low_rank_solver_matches_dense_reference() {
+        let render = |dense: bool| {
+            crate::circuit::stats::FORCE_DENSE.with(|f| f.set(dense));
+            let mut e = Engine::new(SR);
+            e.set_unit(Unit {
+                seed: 7,
+                age_years: 30.0,
+                temp_c: 31.0,
+            });
+            let mut out = Vec::new();
+            for blk in 0..(SR as usize / BLOCK) {
+                if blk % 24 == 0 {
+                    let k = (blk / 24) as u32;
+                    for v in [3, 5, 6, 7, 8] {
+                        e.set_switch(v, k % 2);
+                    }
+                    for s in 0..SLOTS {
+                        e.trigger(
+                            Slot::from_u32(s).unwrap(),
+                            if k.is_multiple_of(3) { 1.0 } else { 0.4 },
+                        );
+                    }
+                }
+                e.process(BLOCK);
+                out.extend_from_slice(&e.out);
+            }
+            crate::circuit::stats::FORCE_DENSE.with(|f| f.set(false));
+            out
+        };
+        let (fast, dense) = (render(false), render(true));
+        let diff = fast
+            .iter()
+            .zip(&dense)
+            .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+        println!("max abs difference fast vs dense: {diff:e}");
+        assert!(diff < 1e-6, "{diff}");
+    }
+
     #[test]
     fn hihat_and_cymbal_share_the_metal_bank() {
         let mut e = Engine::new(SR);

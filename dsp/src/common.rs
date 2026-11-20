@@ -204,10 +204,8 @@ impl Common {
             return 0.0;
         }
         for (k, &out) in outs.iter().enumerate() {
-            self.mix.set_current(
-                self.srcs[k],
-                out * MIX_IN * self.ratio[k] * self.g_leg[k],
-            );
+            self.mix
+                .set_current(self.srcs[k], out * MIX_IN * self.ratio[k] * self.g_leg[k]);
         }
         self.mix.rail = rail;
         self.mix.step();

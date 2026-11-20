@@ -3,6 +3,22 @@
 //! Capacitors use the trapezoidal rule; diodes and op-amps are solved with
 //! Newton-Raphson every sample. All buffers are allocated when the circuit is
 //! built, so `step` never allocates (required inside an AudioWorklet).
+//!
+//! Each nonlinear element changes the MNA matrix only by a rank-one term: a
+//! diode adds its conductance g·(eₚ−e_q)(eₚ−e_q)ᵀ, an op-amp's linearized
+//! gain k fills one row as k·e_r(e₋−e₊)ᵀ. So the matrix is factored once with
+//! every nonlinear element at a nominal value (op-amps at full open-loop
+//! gain, diodes at a small conductance), and each Newton iteration solves the
+//! actual linearization with the Woodbury identity
+//!
+//!   x = y − Z (I + ΔC·W)⁻¹ ΔC·Vᵀy,   y = A₀⁻¹b, Z = A₀⁻¹U, W = VᵀZ,
+//!
+//! where ΔC holds each element's departure from its nominal value. Z and W
+//! only change with the linear part (a knob or part edit), so an iteration
+//! costs one forward/back substitution and an m×m solve (m = number of
+//! diodes and op-amps, at most a handful) instead of a factorization. A
+//! purely linear circuit is just a substitution. The dense pivoting solve of
+//! the full matrix remains as the fallback and as the reference in tests.
 
 pub type Node = usize;
 pub const GND: Node = 0;
@@ -10,7 +26,15 @@ pub const GND: Node = 0;
 const GMIN: f64 = 1e-12;
 const MAX_ITER: usize = 40;
 const TOL_V: f64 = 1e-6;
+/// Newton accepts once every diode's linearized current, at the new
+/// solution, is within this of the exact one (plus 1 ppm of it) ...
+const TOL_I: f64 = 1e-9;
+/// ... and every op-amp's linearized output within this of the tanh curve.
+const TOL_OPAMP_V: f64 = 1e-6;
 const MAX_PLANS: usize = 4;
+/// Nominal diode conductance folded into the factored matrix (1 MΩ): keeps
+/// nodes reached only through diodes from being floating there.
+const G0_DIODE: f64 = 1e-6;
 
 #[derive(Clone, Copy, Debug)]
 enum Elem {
@@ -47,6 +71,8 @@ enum Elem {
         nvt: f64,
         vcrit: f64,
         vd: f64,
+        /// Current and conductance at `vd` (the linearization in use).
+        lin: (f64, f64),
     },
     /// Op-amp as a saturating VCVS: v_out = vsat * tanh(gain * (v+ - v-) / vsat).
     OpAmp {
@@ -57,6 +83,8 @@ enum Elem {
         vsat: f64,
         row: usize,
         vd: f64,
+        /// tanh and slope at `vd` (the linearization in use).
+        lin: (f64, f64),
     },
 }
 
@@ -133,6 +161,7 @@ impl CircuitBuilder {
             nvt: n * vt,
             vcrit: 0.0,
             vd: 0.0,
+            lin: (0.0, 0.0),
         };
         update_vcrit(&mut e);
         self.push(e)
@@ -149,6 +178,7 @@ impl CircuitBuilder {
             vsat: 10.5,
             row,
             vd: 0.0,
+            lin: (0.0, 0.0),
         })
     }
 
@@ -164,8 +194,24 @@ impl CircuitBuilder {
             a: vec![0.0; size * size],
             b: vec![0.0; size],
             x: vec![0.0; size],
+            x_prev: vec![0.0; size],
             perm: vec![0; size],
             pattern: vec![false; size * size],
+            nz: Vec::new(),
+            a_stale: true,
+            nl: Vec::new(),
+            cval: Vec::new(),
+            zmat: Vec::new(),
+            wmat: Vec::new(),
+            mmat: Vec::new(),
+            mrhs: Vec::new(),
+            s: Vec::new(),
+            s_lin: Vec::new(),
+            beta: Vec::new(),
+            gamma: Vec::new(),
+            caps: Vec::new(),
+            srcs: Vec::new(),
+            lowrank: false,
             plans: Vec::with_capacity(MAX_PLANS),
             rail: 1.0,
             dense_only: false,
@@ -175,7 +221,30 @@ impl CircuitBuilder {
             last_iters: 0,
             replans: 0,
         };
+        c.nl = c
+            .elems
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| RankOne::of(i, e, nn))
+            .collect();
+        c.caps = (0..c.elems.len())
+            .filter(|&i| matches!(c.elems[i], Elem::C { .. }))
+            .collect();
+        c.srcs = (0..c.elems.len())
+            .filter(|&i| matches!(c.elems[i], Elem::C { .. } | Elem::V { .. } | Elem::I { .. }))
+            .collect();
+        let m = c.nl.len();
+        c.s = vec![0.0; m];
+        c.s_lin = vec![0.0; m];
+        c.beta = vec![0.0; m];
+        c.gamma = vec![0.0; m];
+        c.cval = vec![0.0; m];
+        c.zmat = vec![0.0; size * m];
+        c.wmat = vec![0.0; m * m];
+        c.mmat = vec![0.0; m * m];
+        c.mrhs = vec![0.0; m];
         c.build_pattern();
+        c.nz = (0..size * size).filter(|&i| c.pattern[i]).collect();
         c.set_sample_rate(sample_rate);
         c
     }
@@ -196,9 +265,40 @@ pub struct Circuit {
     a: Vec<f64>,
     b: Vec<f64>,
     x: Vec<f64>,
+    /// Previous sample's solution, for the predictor.
+    x_prev: Vec<f64>,
     perm: Vec<usize>,
     /// Structural non-zeros of the MNA matrix (fixed by the topology).
     pattern: Vec<bool>,
+    /// Dense indices of `pattern`'s entries: assembling a step copies only
+    /// these from `a_lin`; every other entry of `a` stays zero.
+    nz: Vec<usize>,
+    /// `a` was overwritten by the dense fallback and needs a full reload.
+    a_stale: bool,
+    /// Nonlinear elements as rank-one terms, in element order.
+    nl: Vec<RankOne>,
+    /// This iteration's value (conductance or gain) of each `nl` element.
+    cval: Vec<f64>,
+    /// A₀⁻¹U (n×m, column-major) and VᵀA₀⁻¹U (m×m) for the factored matrix.
+    zmat: Vec<f64>,
+    wmat: Vec<f64>,
+    /// m×m system and right-hand side scratch.
+    mmat: Vec<f64>,
+    mrhs: Vec<f64>,
+    /// Low-rank Newton state (length m): controlling voltages, their part
+    /// from the linear elements, rhs coefficients, and the solution's
+    /// coefficients on Z.
+    s: Vec<f64>,
+    s_lin: Vec<f64>,
+    beta: Vec<f64>,
+    gamma: Vec<f64>,
+    /// Element indices: capacitors, and every element with a right-hand side
+    /// (capacitors and sources).
+    caps: Vec<usize>,
+    srcs: Vec<usize>,
+    /// `lu` holds the factors of `a_lin` (in `plans[0]`'s order) and
+    /// `zmat` / `wmat` match them.
+    lowrank: bool,
     /// Elimination plans for the pivot orders seen so far (most recent first).
     plans: Vec<LuPlan>,
     /// Supply rail relative to nominal; scales every op-amp's output swing.
@@ -320,7 +420,75 @@ impl Circuit {
                 Elem::D { .. } => {}
             }
         }
+        // Nonlinear elements at their nominal values.
+        for t in &self.nl {
+            t.stamp(a, n, t.c0);
+        }
         self.dirty = false;
+        self.lowrank = false;
+    }
+
+    /// Factor `a_lin` and precompute Z and W. Leaves `lowrank` false (so the
+    /// full solve is used) if the nominal matrix cannot be factored.
+    fn setup_lowrank(&mut self) {
+        let n = self.size;
+        let m = self.nl.len();
+        self.a.copy_from_slice(&self.a_lin);
+        self.a_stale = false;
+        let mut ok = self
+            .plans
+            .first()
+            .is_some_and(|p| p.factor(&self.a, &mut self.lu, n));
+        if !ok {
+            // Pivot order for the nominal matrix from dense partial pivoting.
+            self.b.iter_mut().for_each(|v| *v = 0.0);
+            if !solve(&mut self.a, &mut self.b, &mut self.perm, n) {
+                return;
+            }
+            self.a.copy_from_slice(&self.a_lin);
+            self.replans += 1;
+            if self.plans.len() == MAX_PLANS {
+                self.plans.pop();
+            }
+            self.plans
+                .insert(0, LuPlan::new(&self.pattern, &self.perm, n));
+            ok = self.plans[0].factor(&self.a, &mut self.lu, n);
+        }
+        if !ok {
+            return;
+        }
+        for j in 0..m {
+            let col = &mut self.zmat[j * n..(j + 1) * n];
+            col.iter_mut().for_each(|v| *v = 0.0);
+            for &(i, sgn) in self.nl[j].u() {
+                col[i] = sgn;
+            }
+            if !self.plans[0].resubstitute(col, &self.lu, &mut self.bp, n) {
+                return;
+            }
+        }
+        for i in 0..m {
+            for j in 0..m {
+                self.wmat[i * m + j] = self.nl[i].vdot(&self.zmat[j * n..(j + 1) * n]);
+            }
+        }
+        self.lowrank = true;
+    }
+
+    /// Assemble the full linearized matrix into `a` (fallback and tests).
+    fn assemble_full(&mut self) {
+        let n = self.size;
+        if self.a_stale {
+            self.a.copy_from_slice(&self.a_lin);
+            self.a_stale = false;
+        } else {
+            for &i in &self.nz {
+                self.a[i] = self.a_lin[i];
+            }
+        }
+        for (t, &c) in self.nl.iter().zip(&self.cval) {
+            t.stamp(&mut self.a, n, c - t.c0);
+        }
     }
 
     fn build_pattern(&mut self) {
@@ -375,10 +543,13 @@ impl Circuit {
             if self.plans[k].solve(&self.a, &mut self.b, &mut self.lu, &mut self.bp, n) {
                 if k != 0 {
                     self.plans.swap(0, k);
+                    // plans[0] no longer matches the factors in `lu`.
+                    self.lowrank = false;
                 }
                 return true;
             }
         }
+        self.a_stale = true;
         if !solve(&mut self.a, &mut self.b, &mut self.perm, n) {
             return false;
         }
@@ -394,14 +565,36 @@ impl Circuit {
         true
     }
 
+    /// Whether every nonlinear element's linearization, evaluated at the new
+    /// solution, matches its exact curve within tolerance (so another Newton
+    /// iteration would not move the result measurably).
     fn nonlinear_settled(&self) -> bool {
-        self.elems.iter().all(|e| match *e {
-            Elem::D { a, b, nvt, vd, .. } => {
-                ((node_v(&self.x, a) - node_v(&self.x, b)) - vd).abs() < 1e-3 * nvt
-            }
+        let rail = self.rail;
+        self.nl.iter().all(|t| match self.elems[t.elem] {
+            Elem::D {
+                a,
+                b,
+                is,
+                nvt,
+                vd,
+                lin,
+                ..
+            } => diode_settled(node_v(&self.x, a) - node_v(&self.x, b), is, nvt, vd, lin),
             Elem::OpAmp {
-                inp, inn, gain, vd, ..
-            } => (gain * ((node_v(&self.x, inp) - node_v(&self.x, inn)) - vd)).abs() < 1e-4,
+                inp,
+                inn,
+                gain,
+                vsat,
+                vd,
+                lin,
+                ..
+            } => opamp_settled(
+                node_v(&self.x, inp) - node_v(&self.x, inn),
+                gain,
+                vsat * rail,
+                vd,
+                lin,
+            ),
             _ => true,
         })
     }
@@ -411,121 +604,45 @@ impl Circuit {
         if self.dirty {
             self.rebuild_linear();
         }
-        let n = self.size;
-        let nn = self.nn;
+        let dense = self.dense_only || test_force_dense();
+        if !self.lowrank && !dense {
+            self.setup_lowrank();
+        }
         // Capacitor history currents for this step.
-        for e in &mut self.elems {
+        for &i in &self.caps {
             if let Elem::C {
                 geq,
                 j,
                 v_prev,
                 i_prev,
                 ..
-            } = e
+            } = &mut self.elems[i]
             {
                 *j = *geq * *v_prev + *i_prev;
             }
         }
-        let rail = self.rail;
-        let mut iters = 0;
-        loop {
-            iters += 1;
-            self.a.copy_from_slice(&self.a_lin);
-            self.b.iter_mut().for_each(|v| *v = 0.0);
-            let mut limited = false;
-            for e in &mut self.elems {
-                match e {
-                    Elem::C { a: p, b: q, j, .. } => stamp_i(&mut self.b, *p, *q, *j),
-                    Elem::V { v, row, .. } => self.b[nn + *row] = *v,
-                    Elem::I { a: p, b: q, i } => stamp_i(&mut self.b, *q, *p, *i),
-                    Elem::D {
-                        a: p,
-                        b: q,
-                        is,
-                        nvt,
-                        vcrit,
-                        vd,
-                    } => {
-                        let raw = node_v(&self.x, *p) - node_v(&self.x, *q);
-                        let lim = pnjlim(raw, *vd, *nvt, *vcrit);
-                        if (lim - raw).abs() > 1e-12 {
-                            limited = true;
-                        }
-                        *vd = lim;
-                        let ex = (lim / *nvt).min(80.0).exp();
-                        let id = *is * (ex - 1.0);
-                        let gd = *is * ex / *nvt + GMIN;
-                        let ieq = id - gd * lim;
-                        stamp_g(&mut self.a, n, *p, *q, gd);
-                        stamp_i(&mut self.b, *p, *q, -ieq);
-                    }
-                    Elem::OpAmp {
-                        inp,
-                        inn,
-                        row,
-                        gain,
-                        vsat,
-                        vd,
-                        ..
-                    } => {
-                        let r = nn + *row;
-                        let vsat = *vsat * rail;
-                        let raw = node_v(&self.x, *inp) - node_v(&self.x, *inn);
-                        // Limit the step in tanh units so Newton cannot bounce
-                        // between the two saturated rails.
-                        // Junction-style limiting in tanh units: inside the
-                        // linear region or staying saturated on the same rail
-                        // Newton is safe; otherwise land at the edge of the
-                        // linear region on the new side first.
-                        let to_arg = *gain / vsat;
-                        let (arg_old, arg_raw) = (*vd * to_arg, raw * to_arg);
-                        let vd0 = if arg_raw.abs() <= 3.0
-                            || (arg_old.abs() >= 3.0 && arg_old.signum() == arg_raw.signum())
-                        {
-                            raw
-                        } else if arg_old * arg_raw < 0.0 {
-                            // Crossing over: land mid-range, where the linearization
-                            // is exact, instead of ping-ponging between ±3.
-                            limited = true;
-                            0.0
-                        } else {
-                            limited = true;
-                            arg_raw.clamp(-3.0, 3.0) / to_arg
-                        };
-                        *vd = vd0;
-                        let t = (*gain * vd0 / vsat).tanh();
-                        let k = *gain * (1.0 - t * t);
-                        if *inp != GND {
-                            self.a[r * n + *inp - 1] -= k;
-                        }
-                        if *inn != GND {
-                            self.a[r * n + *inn - 1] += k;
-                        }
-                        self.b[r] = vsat * t - k * vd0;
-                    }
-                    Elem::R { .. } => {}
-                }
-            }
-            if !self.solve_step() {
-                // Singular matrix: keep the previous solution rather than emit NaN.
-                break;
-            }
-            let mut delta = 0.0f64;
-            for i in 0..nn {
-                delta = delta.max((self.b[i] - self.x[i]).abs());
-            }
-            self.x.copy_from_slice(&self.b);
-            // Accept after one solve when no nonlinear element moved away from
-            // its linearization point; most samples then cost a single LU.
-            if (!limited && (delta < TOL_V || self.nonlinear_settled())) || iters >= MAX_ITER {
-                break;
-            }
+        // Linearize the first iteration at the solution extrapolated from the
+        // last two samples rather than at the last one: the nonlinear elements
+        // then usually land within tolerance after a single solve.
+        for (x, xp) in self.x.iter_mut().zip(self.x_prev.iter_mut()) {
+            let now = *x;
+            *x = 2.0 * now - *xp;
+            *xp = now;
         }
+        let low = if self.lowrank && !dense {
+            self.newton_lowrank()
+        } else {
+            None
+        };
+        let iters = match low {
+            Some(it) => it,
+            None => self.newton_full(),
+        };
         self.last_iters = iters;
         #[cfg(test)]
         stats::record(iters, iters >= MAX_ITER);
         // Commit capacitor state.
-        for e in &mut self.elems {
+        for &i in &self.caps {
             if let Elem::C {
                 a: p,
                 b: q,
@@ -534,7 +651,7 @@ impl Circuit {
                 v_prev,
                 i_prev,
                 ..
-            } = e
+            } = &mut self.elems[i]
             {
                 let v = node_v(&self.x, *p) - node_v(&self.x, *q);
                 *i_prev = *geq * v - *j;
@@ -542,6 +659,370 @@ impl Circuit {
             }
         }
     }
+
+    /// Right-hand side of the linear elements (capacitor history, sources).
+    fn linear_rhs(&mut self) {
+        let nn = self.nn;
+        self.b.iter_mut().for_each(|v| *v = 0.0);
+        for &i in &self.srcs {
+            match self.elems[i] {
+                Elem::C { a: p, b: q, j, .. } => stamp_i(&mut self.b, p, q, j),
+                Elem::V { v, row, .. } => self.b[nn + row] = v,
+                Elem::I { a: p, b: q, i } => stamp_i(&mut self.b, q, p, i),
+                _ => {}
+            }
+        }
+    }
+
+    /// Linearize nonlinear element `j` of `nl` at controlling voltage `raw`.
+    /// Sets `cval[j]` and returns (limited, rhs coefficient on its u column).
+    fn linearize(&mut self, j: usize, raw: f64) -> (bool, f64) {
+        let rail = self.rail;
+        match &mut self.elems[self.nl[j].elem] {
+            Elem::D {
+                is,
+                nvt,
+                vcrit,
+                vd,
+                lin,
+                ..
+            } => {
+                let (limited, id, gd) = lin_diode(raw, vd, *is, *nvt, *vcrit);
+                *lin = (id, gd);
+                self.cval[j] = gd;
+                // The companion current source −(id − gd·vd) flows a → b.
+                (limited, -(id - gd * *vd))
+            }
+            Elem::OpAmp {
+                gain,
+                vsat,
+                vd,
+                lin,
+                ..
+            } => {
+                let vsat = *vsat * rail;
+                let (limited, t, k) = lin_opamp(raw, vd, *gain, vsat);
+                *lin = (t, k);
+                self.cval[j] = k;
+                (limited, vsat * t - k * *vd)
+            }
+            _ => (false, 0.0),
+        }
+    }
+
+    /// Newton on the nonlinear elements' m controlling voltages only, from
+    /// the factored nominal matrix (see the module doc). Within one sample,
+    /// x = y + Z·γ where y = A₀⁻¹b_lin is fixed, so an iteration costs O(m²);
+    /// x itself is formed once at the end. None if the low-rank solve breaks
+    /// down (the caller falls back to the full solve).
+    fn newton_lowrank(&mut self) -> Option<usize> {
+        let n = self.size;
+        let m = self.nl.len();
+        self.linear_rhs();
+        if !self.plans[0].resubstitute(&mut self.b, &self.lu, &mut self.bp, n) {
+            return None;
+        }
+        if m == 0 {
+            self.x.copy_from_slice(&self.b);
+            return Some(1);
+        }
+        for j in 0..m {
+            self.s_lin[j] = self.nl[j].vdot(&self.b);
+            self.s[j] = self.nl[j].vdot(&self.x);
+        }
+        let mut iters = 0;
+        loop {
+            iters += 1;
+            let mut limited = false;
+            for j in 0..m {
+                let raw = self.nl[j].vsign * self.s[j];
+                let (lim, beta) = self.linearize(j, raw);
+                limited |= lim;
+                self.beta[j] = beta;
+            }
+            // (I + ΔC·W) z = ΔC·Vᵀy with Vᵀy = s_lin + W·β; then γ = β − z
+            // and the new controlling voltages are s_lin + W·γ.
+            for i in 0..m {
+                let dc = self.cval[i] - self.nl[i].c0;
+                let row = &self.wmat[i * m..(i + 1) * m];
+                let q = self.s_lin[i] + dot(row, &self.beta);
+                for (j, w) in row.iter().enumerate() {
+                    self.mmat[i * m + j] = dc * w + if i == j { 1.0 } else { 0.0 };
+                }
+                self.mrhs[i] = dc * q;
+            }
+            if !small_solve(&mut self.mmat, &mut self.mrhs, m) {
+                return None;
+            }
+            for j in 0..m {
+                self.gamma[j] = self.beta[j] - self.mrhs[j];
+            }
+            for i in 0..m {
+                self.s[i] = self.s_lin[i] + dot(&self.wmat[i * m..(i + 1) * m], &self.gamma);
+            }
+            if iters >= MAX_ITER || (!limited && self.lowrank_settled()) {
+                break;
+            }
+        }
+        for j in 0..m {
+            let g = self.gamma[j];
+            if g != 0.0 {
+                for (y, z) in self.b.iter_mut().zip(&self.zmat[j * n..(j + 1) * n]) {
+                    *y += z * g;
+                }
+            }
+        }
+        if !self.b.iter().all(|v| v.is_finite()) {
+            return None;
+        }
+        self.x.copy_from_slice(&self.b);
+        Some(iters)
+    }
+
+    /// `nonlinear_settled` on the controlling voltages `s`.
+    fn lowrank_settled(&self) -> bool {
+        let rail = self.rail;
+        self.nl.iter().zip(&self.s).all(|(t, &s)| {
+            let v = t.vsign * s;
+            match self.elems[t.elem] {
+                Elem::D {
+                    is, nvt, vd, lin, ..
+                } => diode_settled(v, is, nvt, vd, lin),
+                Elem::OpAmp {
+                    gain,
+                    vsat,
+                    vd,
+                    lin,
+                    ..
+                } => opamp_settled(v, gain, vsat * rail, vd, lin),
+                _ => true,
+            }
+        })
+    }
+
+    /// Newton on the fully assembled matrix: the reference path (tests) and
+    /// the fallback when the nominal matrix cannot be factored.
+    fn newton_full(&mut self) -> usize {
+        let nn = self.nn;
+        let m = self.nl.len();
+        let mut iters = 0;
+        loop {
+            iters += 1;
+            self.linear_rhs();
+            let mut limited = false;
+            for j in 0..m {
+                let raw = self.nl[j].vdot(&self.x) * self.nl[j].vsign;
+                let (lim, beta) = self.linearize(j, raw);
+                limited |= lim;
+                for &(i, sgn) in self.nl[j].u() {
+                    self.b[i] += sgn * beta;
+                }
+            }
+            self.assemble_full();
+            if !self.solve_step() {
+                // Singular matrix: keep the previous solution rather than emit NaN.
+                if iters == 1 {
+                    self.x.copy_from_slice(&self.x_prev);
+                }
+                break;
+            }
+            let mut delta = 0.0f64;
+            for i in 0..nn {
+                delta = delta.max((self.b[i] - self.x[i]).abs());
+            }
+            self.x.copy_from_slice(&self.b);
+            if (!limited && (delta < TOL_V || self.nonlinear_settled())) || iters >= MAX_ITER {
+                break;
+            }
+        }
+        iters
+    }
+}
+
+/// Diode linearization at `raw` with SPICE junction limiting against the
+/// previous point `vd` (updated). Returns (limited, current, conductance).
+fn lin_diode(raw: f64, vd: &mut f64, is: f64, nvt: f64, vcrit: f64) -> (bool, f64, f64) {
+    let lim = pnjlim(raw, *vd, nvt, vcrit);
+    *vd = lim;
+    let ex = (lim / nvt).min(80.0).exp();
+    (
+        (lim - raw).abs() > 1e-12,
+        is * (ex - 1.0),
+        is * ex / nvt + GMIN,
+    )
+}
+
+/// Op-amp linearization at differential input `raw` against the previous
+/// point `vd` (updated). Returns (limited, tanh, slope).
+fn lin_opamp(raw: f64, vd: &mut f64, gain: f64, vsat: f64) -> (bool, f64, f64) {
+    // Junction-style limiting in tanh units: inside the linear region or
+    // staying saturated on the same rail Newton is safe; otherwise land at
+    // the edge of the linear region on the new side first, so Newton cannot
+    // bounce between the two saturated rails.
+    let to_arg = gain / vsat;
+    let (arg_old, arg_raw) = (*vd * to_arg, raw * to_arg);
+    let (limited, vd0) =
+        if arg_raw.abs() <= 3.0 || (arg_old.abs() >= 3.0 && arg_old.signum() == arg_raw.signum()) {
+            (false, raw)
+        } else if arg_old * arg_raw < 0.0 {
+            // Crossing over: land mid-range, where the linearization is exact,
+            // instead of ping-ponging between ±3.
+            (true, 0.0)
+        } else {
+            (true, arg_raw.clamp(-3.0, 3.0) / to_arg)
+        };
+    *vd = vd0;
+    let t = (gain * vd0 / vsat).tanh();
+    (limited, t, gain * (1.0 - t * t))
+}
+
+/// The diode's linearized current at `v` is within tolerance of the exact one.
+fn diode_settled(v: f64, is: f64, nvt: f64, vd: f64, (id, gd): (f64, f64)) -> bool {
+    let exact = is * ((v / nvt).min(80.0).exp() - 1.0);
+    (exact - (id + gd * (v - vd))).abs() <= TOL_I + 1e-6 * exact.abs()
+}
+
+/// The op-amp's linearized output at `v` is within tolerance of the curve.
+fn opamp_settled(v: f64, gain: f64, vsat: f64, vd: f64, (t, k): (f64, f64)) -> bool {
+    let exact = vsat * (gain * v / vsat).tanh();
+    (exact - (vsat * t + k * (v - vd))).abs() <= TOL_OPAMP_V
+}
+
+#[inline]
+fn dot(a: &[f64], b: &[f64]) -> f64 {
+    a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
+
+/// A nonlinear element as the rank-one matrix term c·u·vᵀ (matrix indices).
+struct RankOne {
+    /// Index in `elems`.
+    elem: usize,
+    /// vᵀx times this is the element's controlling voltage (diode
+    /// anode−cathode, op-amp + minus −).
+    vsign: f64,
+    u: [(usize, f64); 2],
+    nu: usize,
+    v: [(usize, f64); 2],
+    nv: usize,
+    /// Nominal value folded into the factored matrix.
+    c0: f64,
+}
+
+impl RankOne {
+    fn of(elem: usize, e: &Elem, nn: usize) -> Option<Self> {
+        let pair = |p: Node, q: Node| {
+            let mut t = [(0, 0.0); 2];
+            let mut k = 0;
+            for (nd, sgn) in [(p, 1.0), (q, -1.0)] {
+                if nd != GND {
+                    t[k] = (nd - 1, sgn);
+                    k += 1;
+                }
+            }
+            (t, k)
+        };
+        match *e {
+            Elem::D { a, b, .. } => {
+                let (u, nu) = pair(a, b);
+                Some(Self {
+                    elem,
+                    vsign: 1.0,
+                    u,
+                    nu,
+                    v: u,
+                    nv: nu,
+                    c0: G0_DIODE,
+                })
+            }
+            Elem::OpAmp {
+                inp,
+                inn,
+                row,
+                gain,
+                ..
+            } => {
+                let (v, nv) = pair(inn, inp);
+                Some(Self {
+                    elem,
+                    vsign: -1.0,
+                    u: [(nn + row, 1.0), (0, 0.0)],
+                    nu: 1,
+                    v,
+                    nv,
+                    c0: gain,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn u(&self) -> &[(usize, f64)] {
+        &self.u[..self.nu]
+    }
+
+    fn vdot(&self, x: &[f64]) -> f64 {
+        self.v[..self.nv].iter().map(|&(i, s)| s * x[i]).sum()
+    }
+
+    /// a += c·u·vᵀ
+    fn stamp(&self, a: &mut [f64], n: usize, c: f64) {
+        for &(i, su) in self.u() {
+            for &(j, sv) in &self.v[..self.nv] {
+                a[i * n + j] += c * su * sv;
+            }
+        }
+    }
+}
+
+/// Gaussian elimination with partial pivoting on a small dense m×m system
+/// (row-major `a`); the solution replaces `b`.
+fn small_solve(a: &mut [f64], b: &mut [f64], m: usize) -> bool {
+    for k in 0..m {
+        let mut piv = k;
+        for i in (k + 1)..m {
+            if a[i * m + k].abs() > a[piv * m + k].abs() {
+                piv = i;
+            }
+        }
+        if a[piv * m + k].abs() < 1e-300 {
+            return false;
+        }
+        if piv != k {
+            for j in 0..m {
+                a.swap(k * m + j, piv * m + j);
+            }
+            b.swap(k, piv);
+        }
+        let inv = 1.0 / a[k * m + k];
+        for i in (k + 1)..m {
+            let f = a[i * m + k] * inv;
+            if f != 0.0 {
+                for j in (k + 1)..m {
+                    a[i * m + j] -= f * a[k * m + j];
+                }
+                b[i] -= f * b[k];
+            }
+        }
+    }
+    for k in (0..m).rev() {
+        let mut s = b[k];
+        for j in (k + 1)..m {
+            s -= a[k * m + j] * b[j];
+        }
+        b[k] = s / a[k * m + k];
+    }
+    b.iter().all(|v| v.is_finite())
+}
+
+/// Tests can force every circuit onto the dense full solve to compare.
+#[cfg(test)]
+fn test_force_dense() -> bool {
+    stats::FORCE_DENSE.with(|f| f.get())
+}
+#[cfg(not(test))]
+#[inline]
+fn test_force_dense() -> bool {
+    false
 }
 
 #[inline]
@@ -596,14 +1077,34 @@ fn pnjlim(vnew: f64, vold: f64, nvt: f64, vcrit: f64) -> f64 {
     }
 }
 
-/// Elimination order and structural non-zeros for a fixed row permutation.
+/// Elimination plan for a fixed row permutation, compiled into flat index
+/// lists over the structural non-zeros (fill-in included) of the permuted
+/// matrix. A solve touches only those entries, in compact storage, so its
+/// cost follows the number of non-zeros instead of n².
 struct LuPlan {
     /// Row `r` of the permuted system is row `perm[r]` of the original.
     perm: Vec<usize>,
-    /// For pivot `k`: rows below with a (possibly filled-in) entry in column `k`.
-    below: Vec<Vec<usize>>,
-    /// For pivot `k`: columns right of `k` with an entry in row `k`.
-    right: Vec<Vec<usize>>,
+    /// (slot, dense index into the unpermuted matrix) of each structural entry.
+    load: Vec<(u32, u32)>,
+    /// Slots that only appear as fill-in; zeroed before each factorization.
+    fill: Vec<u32>,
+    /// Slot of each pivot.
+    diag: Vec<u32>,
+    /// Per pivot: range of `rows`.
+    rows_at: Vec<(u32, u32)>,
+    /// Rows below a pivot with an entry in its column:
+    /// (slot of that entry, row, range of `pairs`).
+    rows: Vec<(u32, u32, u32, u32)>,
+    /// Row updates: (slot (i, j), slot (k, j)) for j right of pivot k.
+    pairs: Vec<(u32, u32)>,
+    /// Per pivot: range of `back`.
+    back_at: Vec<(u32, u32)>,
+    /// Back substitution terms: (slot (k, j), j).
+    back: Vec<(u32, u32)>,
+    /// Forward substitution in pivot order: (slot (i, k), i, k).
+    fwd: Vec<(u32, u32, u32)>,
+    /// Number of slots (`lu` must be at least this long).
+    slots: usize,
 }
 
 impl LuPlan {
@@ -614,62 +1115,158 @@ impl LuPlan {
                 pat[r * n + j] = pattern[perm[r] * n + j];
             }
         }
+        let orig = pat.clone();
+        // Symbolic elimination: which entries fill in.
         let mut below = vec![Vec::new(); n];
         let mut right = vec![Vec::new(); n];
         for k in 0..n {
-            below[k] = ((k + 1)..n).filter(|&i| pat[i * n + k]).collect();
-            right[k] = ((k + 1)..n).filter(|&j| pat[k * n + j]).collect();
+            pat[k * n + k] = true;
+            below[k] = ((k + 1)..n).filter(|&i| pat[i * n + k]).collect::<Vec<_>>();
+            right[k] = ((k + 1)..n).filter(|&j| pat[k * n + j]).collect::<Vec<_>>();
             for &i in &below[k] {
                 for &j in &right[k] {
                     pat[i * n + j] = true;
                 }
             }
         }
-        Self {
-            perm: perm.to_vec(),
-            below,
-            right,
+        let mut slot = vec![u32::MAX; n * n];
+        let (mut load, mut fill) = (Vec::new(), Vec::new());
+        let mut count = 0u32;
+        for r in 0..n {
+            for j in 0..n {
+                if pat[r * n + j] {
+                    slot[r * n + j] = count;
+                    if orig[r * n + j] {
+                        load.push((count, (perm[r] * n + j) as u32));
+                    } else {
+                        fill.push(count);
+                    }
+                    count += 1;
+                }
+            }
         }
+        let at = |i: usize, j: usize| slot[i * n + j];
+        let mut plan = Self {
+            perm: perm.to_vec(),
+            load,
+            fill,
+            diag: (0..n).map(|k| at(k, k)).collect(),
+            rows_at: Vec::with_capacity(n),
+            rows: Vec::new(),
+            pairs: Vec::new(),
+            back_at: Vec::with_capacity(n),
+            back: Vec::new(),
+            fwd: Vec::new(),
+            slots: count as usize,
+        };
+        for k in 0..n {
+            let r0 = plan.rows.len() as u32;
+            for &i in &below[k] {
+                let p0 = plan.pairs.len() as u32;
+                plan.pairs
+                    .extend(right[k].iter().map(|&j| (at(i, j), at(k, j))));
+                plan.fwd.push((at(i, k), i as u32, k as u32));
+                plan.rows
+                    .push((at(i, k), i as u32, p0, plan.pairs.len() as u32));
+            }
+            plan.rows_at.push((r0, plan.rows.len() as u32));
+            let b0 = plan.back.len() as u32;
+            plan.back
+                .extend(right[k].iter().map(|&j| (at(k, j), j as u32)));
+            plan.back_at.push((b0, plan.back.len() as u32));
+        }
+        // `resubstitute` indexes without bounds checks; everything it reads
+        // comes from here, so check it once.
+        let slots = plan.slots as u32;
+        assert!(plan.perm.iter().all(|&r| r < n));
+        assert!(plan.diag.iter().all(|&d| d < slots));
+        assert!(plan
+            .fwd
+            .iter()
+            .all(|&(s, i, k)| s < slots && (i as usize) < n && (k as usize) < n));
+        assert!(plan
+            .back
+            .iter()
+            .all(|&(s, j)| s < slots && (j as usize) < n));
+        assert!(
+            plan.back_at.len() == n
+                && plan
+                    .back_at
+                    .iter()
+                    .all(|&(b0, b1)| b0 <= b1 && b1 as usize <= plan.back.len())
+        );
+        plan
     }
 
-    /// Returns false (leaving `b` untouched) if a pivot is too small relative
-    /// to its column, so the caller can re-pivot densely.
+    /// Factor `a` and solve for `b` (solution into `b`). Returns false
+    /// (leaving `b` untouched) if a pivot is too small relative to its column,
+    /// so the caller can re-pivot densely.
     fn solve(&self, a: &[f64], b: &mut [f64], lu: &mut [f64], bp: &mut [f64], n: usize) -> bool {
-        for r in 0..n {
-            let src = self.perm[r];
-            lu[r * n..(r + 1) * n].copy_from_slice(&a[src * n..(src + 1) * n]);
-            bp[r] = b[src];
+        self.factor(a, lu, n) && self.resubstitute(b, lu, bp, n)
+    }
+
+    /// Factor `a` into `lu` (multipliers below the diagonal). Returns false
+    /// if a pivot is too small relative to its column.
+    fn factor(&self, a: &[f64], lu: &mut [f64], n: usize) -> bool {
+        for &(s, src) in &self.load {
+            lu[s as usize] = a[src as usize];
+        }
+        for &s in &self.fill {
+            lu[s as usize] = 0.0;
         }
         for k in 0..n {
-            let piv = lu[k * n + k];
-            let col_max = self.below[k]
+            let piv = lu[self.diag[k] as usize];
+            let (r0, r1) = self.rows_at[k];
+            let rows = &self.rows[r0 as usize..r1 as usize];
+            let col_max = rows
                 .iter()
-                .fold(0.0f64, |m, &i| m.max(lu[i * n + k].abs()));
+                .fold(0.0f64, |m, r| m.max(lu[r.0 as usize].abs()));
             if !(piv.abs() > 1e-300 && piv.abs() >= 1e-3 * col_max) {
                 return false;
             }
             let inv = 1.0 / piv;
-            for &i in &self.below[k] {
-                let f = lu[i * n + k] * inv;
+            for &(ik, _, p0, p1) in rows {
+                let f = lu[ik as usize] * inv;
+                lu[ik as usize] = f;
                 if f != 0.0 {
-                    for &j in &self.right[k] {
-                        lu[i * n + j] -= f * lu[k * n + j];
+                    for &(ij, kj) in &self.pairs[p0 as usize..p1 as usize] {
+                        lu[ij as usize] -= f * lu[kj as usize];
                     }
-                    bp[i] -= f * bp[k];
                 }
             }
         }
-        for k in (0..n).rev() {
-            let mut s = bp[k];
-            for &j in &self.right[k] {
-                s -= lu[k * n + j] * bp[j];
+        true
+    }
+
+    /// Solve for `b` (solution into `b`) with the factors in `lu`; false
+    /// (leaving `b` untouched) if the result is not finite.
+    fn resubstitute(&self, b: &mut [f64], lu: &[f64], bp: &mut [f64], n: usize) -> bool {
+        // This runs once per circuit per sample, so it skips bounds checks.
+        assert!(n == self.perm.len() && b.len() >= n && bp.len() >= n && lu.len() >= self.slots);
+        // SAFETY: the lengths were just checked, and `LuPlan::new` asserted
+        // that every row index is < n and every slot < `slots`.
+        unsafe {
+            for r in 0..n {
+                *bp.get_unchecked_mut(r) = *b.get_unchecked(*self.perm.get_unchecked(r));
             }
-            bp[k] = s / lu[k * n + k];
+            for &(ik, i, k) in &self.fwd {
+                let bk = *bp.get_unchecked(k as usize);
+                *bp.get_unchecked_mut(i as usize) -= lu.get_unchecked(ik as usize) * bk;
+            }
+            for k in (0..n).rev() {
+                let (b0, b1) = *self.back_at.get_unchecked(k);
+                let mut s = *bp.get_unchecked(k);
+                for &(kj, j) in self.back.get_unchecked(b0 as usize..b1 as usize) {
+                    s -= lu.get_unchecked(kj as usize) * bp.get_unchecked(j as usize);
+                }
+                *bp.get_unchecked_mut(k) =
+                    s / lu.get_unchecked(*self.diag.get_unchecked(k) as usize);
+            }
         }
-        if !bp.iter().all(|v| v.is_finite()) {
+        if !bp[..n].iter().all(|v| v.is_finite()) {
             return false;
         }
-        b.copy_from_slice(bp);
+        b[..n].copy_from_slice(&bp[..n]);
         true
     }
 }
@@ -783,6 +1380,7 @@ pub mod stats {
     use std::cell::Cell;
     thread_local! {
         static S: Cell<(u64, u64, u64)> = const { Cell::new((0, 0, 0)) };
+        pub static FORCE_DENSE: Cell<bool> = const { Cell::new(false) };
     }
     pub fn record(iters: usize, maxed: bool) {
         S.with(|s| {

@@ -107,6 +107,7 @@ pub struct TomConga {
     noise: Noise,
     salt: u32,
     trig: ElemId,
+    ntrig: ElemId,
     nsrc: ElemId,
     e_c1: ElemId,
     e_c2: ElemId,
@@ -129,11 +130,13 @@ pub struct TomConga {
     /// Nodes watched by the sleeper: ones that rest at exactly 0 V (the diode
     /// bias holds the ground leg, the bridge middle and the pitch envelope at
     /// a standing DC level, so they never go quiet).
-    watch: [Node; 4],
+    watch: [Node; 3],
+    /// Noise filter nodes (to tell when the burst has died away).
+    filt: [Node; 3],
     out: Node,
     nenv: Node,
     nout: Node,
-    /// Noise filter still being stepped.
+    /// Noise circuit still being stepped.
     nz_live: bool,
     conga: bool,
     pending: bool,
@@ -202,18 +205,21 @@ impl TomConga {
         let out = cb.node();
         pm.c(&mut cb, o, out, "C7 output", K::Electrolytic, 1e-6);
         pm.r(&mut cb, out, GND, "R8 load", 10e3);
-        // Noise envelope; its charge path is the switch contact.
-        let nk = cb.node();
-        let nenv = cb.node();
-        let e_nch = cb.resistor(trig_n, nk, 1e3);
-        let p_nch = pm.add("R9 noise env charge", K::Carbon, 1e3);
-        pm.d(&mut cb, nk, nenv, "D3 noise env");
-        pm.c(&mut cb, nenv, GND, "C8 noise env", K::Electrolytic, 0.47e-6);
-        pm.r(&mut cb, nenv, GND, "R10 noise env discharge", 68e3);
 
-        // Noise filter (separate, linear).
+        // Noise envelope and filter: a separate circuit, joined to the body
+        // only through the (ideal) trigger line, so splitting it off is exact.
         pm.target = 1;
         let mut nb = CircuitBuilder::new();
+        let nt = nb.node();
+        let ntrig = nb.vsource(nt, GND);
+        // The envelope's charge path is the switch contact.
+        let nk = nb.node();
+        let nenv = nb.node();
+        let e_nch = nb.resistor(nt, nk, 1e3);
+        let p_nch = pm.add("R9 noise env charge", K::Carbon, 1e3);
+        pm.d(&mut nb, nk, nenv, "D3 noise env");
+        pm.c(&mut nb, nenv, GND, "C8 noise env", K::Electrolytic, 0.47e-6);
+        pm.r(&mut nb, nenv, GND, "R10 noise env discharge", 68e3);
         let n0 = nb.node();
         let n1 = nb.node();
         let n2 = nb.node();
@@ -235,6 +241,7 @@ impl TomConga {
             noise: Noise(spec.noise_seed),
             salt: spec.salt,
             trig,
+            ntrig,
             nsrc,
             e_c1,
             e_c2,
@@ -254,7 +261,8 @@ impl TomConga {
             p_stand,
             vr_tom: spec.vr_tom,
             vr_conga: spec.vr_conga,
-            watch: [o, out, inv, nenv],
+            watch: [o, out, inv],
+            filt: [n1, n2, nout],
             out,
             nenv,
             nout,
@@ -298,7 +306,7 @@ impl TomConga {
         self.c
             .set_resistance(self.e_rb, pm.eff(self.p_rt) + pm.eff(vr));
         let nch = if self.conga { 1e9 } else { pm.eff(self.p_nch) };
-        self.c.set_resistance(self.e_nch, nch);
+        self.nz.set_resistance(self.e_nch, nch);
     }
 
     pub fn is_conga(&self) -> bool {
@@ -348,22 +356,31 @@ impl Voice for TomConga {
         self.c.set_voltage(self.trig, p);
         self.set_bias(bus.rail);
         self.c.step();
-        // Noise VCA ahead of the (linear) filter: equivalent to the VCA after
-        // it while the gain moves slowly next to the filter's sub-ms time
-        // constants, and it lets the filter stop when the burst is over.
-        let g = vca_gain(self.c.v(self.nenv));
+        // The noise circuit runs from a tom trigger until its envelope has
+        // fallen well below the VCA's threshold and the filter is quiet; a
+        // conga never charges the envelope, so it never runs.
         let mut noise = 0.0;
-        if g > 0.0 || self.nz_live {
+        if self.nz_live || (p > 0.0 && !self.conga) {
+            // Noise VCA ahead of the (linear) filter: equivalent to the VCA
+            // after it while the gain moves slowly next to the filter's
+            // sub-ms time constants, and it lets the filter go quiet.
+            let g = vca_gain(self.nz.v(self.nenv));
             let n = self.noise.tick();
+            self.nz.rail = bus.rail;
+            self.nz.set_voltage(self.ntrig, p);
             self.nz.set_voltage(self.nsrc, n * g * NOISE_DRIVE);
             self.nz.step();
             noise = self.nz.v(self.nout);
-            self.nz_live = g > 0.0 || self.nz.energy() > 1e-6;
+            let filt = self
+                .filt
+                .iter()
+                .fold(0.0f64, |m, &k| m.max(self.nz.v(k).abs()));
+            self.nz_live = p > 0.0 || self.nz.v(self.nenv) > 0.05 || filt > 1e-6;
         }
-        let level = self
-            .watch
-            .iter()
-            .fold(self.nz.energy(), |m, &n| m.max(self.c.v(n).abs()));
+        let level = self.watch.iter().fold(
+            if self.nz_live { self.nz.energy() } else { 0.0 },
+            |m, &n| m.max(self.c.v(n).abs()),
+        );
         self.sleep.observe_level(level);
         self.c.v(self.out) + noise * NOISE_MIX
     }
