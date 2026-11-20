@@ -35,7 +35,10 @@ export type ToWorklet =
   | { type: 'master'; value: number }
   | { type: 'accent'; value: number }
   | { type: 'seq'; vel: Velocities; rolls: Rolls; length: number; bpm: number; swing: number; playing: boolean }
+  /** Requests a 'parts' reply; only sent while the parts table is open. */
   | { type: 'getParts' }
+  /** Engine oversampling: 2 = full quality, 1 = light (about half the load). Ignored by engines without it. */
+  | { type: 'oversample'; factor: 1 | 2 }
   /** Follow the internal tempo or incoming MIDI clock. */
   | { type: 'sync'; mode: SyncMode }
   /** MIDI realtime message; `frame` is when it should take effect on the context timeline. */
@@ -49,8 +52,9 @@ export type FromWorklet =
   /**
    * Share of the real-time budget spent rendering, 0..1+ (above 1 = dropouts); peakLoad −1 = unknown.
    * clockBpm is the tempo measured from MIDI clock, −1 when not following it.
+   * oversample is the engine's current factor (1 or 2), 0 when the engine cannot switch it.
    */
-  | { type: 'stats'; load: number; peakLoad: number; clockBpm: number }
+  | { type: 'stats'; load: number; peakLoad: number; clockBpm: number; oversample: number }
   | { type: 'parts'; voices: PartInfo[][] }
   | { type: 'error'; message: string }
   /** The engine was rebuilt after an error; settings must be sent again. */

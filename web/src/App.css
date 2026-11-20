@@ -509,6 +509,11 @@ td.scale button {
   padding: 3px 8px;
 }
 
+/* The quality choices are longer than the other selects. */
+.unit-controls select.quality {
+  width: auto;
+}
+
 .bars {
   display: flex;
 }
@@ -562,6 +567,18 @@ td.scale button {
   align-items: center;
   gap: 0.5em;
   color: var(--accent);
+  font-size: 0.85rem;
+}
+
+.notice {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5em;
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
   font-size: 0.85rem;
 }
 

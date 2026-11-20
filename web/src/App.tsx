@@ -80,6 +80,26 @@ function savedLatency(): LatencyMode {
   return 'interactive'
 }
 
+/** 'auto' renders at 2x and drops to 1x for the rest of the session if the device cannot keep up. */
+type Quality = 'auto' | 'high' | 'light'
+const QUALITY_KEY = 'solder808.quality'
+function savedQuality(): Quality {
+  try {
+    const v = localStorage.getItem(QUALITY_KEY)
+    if (v === 'auto' || v === 'high' || v === 'light') return v
+  } catch {
+    // Storage unavailable: use the default.
+  }
+  return 'auto'
+}
+// Auto quality steps down after this many consecutive stats reports (0.5 s each) above AUTO_LOAD.
+const AUTO_LOAD = 0.8
+const AUTO_REPORTS = 4
+// Load right after starting, a reset, a quality change or returning to the tab is not representative.
+const SETTLE_MS = 1000
+// The parts table is refreshed this long after the last knob, unit or part change.
+const PARTS_DEBOUNCE_MS = 150
+
 const footer = (
   <footer className="site-footer">
     <a href="https://github.com/tainakanchu/Solder808" target="_blank" rel="noopener noreferrer">
@@ -127,8 +147,54 @@ export default function App() {
   const midiRef = useRef<MIDIAccess | null>(null)
   const syncRef = useRef('internal')
   const following = syncInput !== 'internal'
+  const [quality, setQuality] = useState<Quality>(savedQuality)
+  // Auto quality stepped down this session; it does not step back up on its own.
+  const [autoLight, setAutoLight] = useState(false)
+  const [lightNotice, setLightNotice] = useState(false)
+  // The engine's oversampling as last reported: 0 = cannot switch, -1 = no report yet.
+  const [oversample, setOversample] = useState(-1)
+  const factor = quality === 'light' || (quality === 'auto' && autoLight) ? 1 : 2
+  const [partsOpen, setPartsOpen] = useState(false)
+  // Bumped by part edits so the parts table is refreshed from the engine.
+  const [partEdits, setPartEdits] = useState(0)
+  // Read by the worklet message handler, which is set up once.
+  const liveRef = useRef({ quality, autoLight, playing: false })
+  const hotReportsRef = useRef(0)
+  const settleUntilRef = useRef(0)
+  const settle = () => {
+    settleUntilRef.current = performance.now() + SETTLE_MS
+    hotReportsRef.current = 0
+  }
 
   const send = useCallback((m: ToWorklet) => engineRef.current?.send(m), [])
+
+  /** Auto quality: step down to 1x once the load stays above AUTO_LOAD while playing. */
+  const watchLoad = (load: number, engineFactor: number) => {
+    const live = liveRef.current
+    const counting =
+      live.quality === 'auto' &&
+      !live.autoLight &&
+      engineFactor === 2 &&
+      live.playing &&
+      document.visibilityState === 'visible' &&
+      performance.now() >= settleUntilRef.current
+    hotReportsRef.current = counting && load > AUTO_LOAD ? hotReportsRef.current + 1 : 0
+    if (hotReportsRef.current < AUTO_REPORTS) return
+    hotReportsRef.current = 0
+    liveRef.current = { ...live, autoLight: true }
+    setAutoLight(true)
+    setLightNotice(true)
+  }
+
+  const chooseQuality = (q: Quality) => {
+    try {
+      localStorage.setItem(QUALITY_KEY, q)
+    } catch {
+      // Without storage the choice lasts until reload.
+    }
+    setQuality(q)
+    setLightNotice(false)
+  }
 
   const ensureEngine = async () => {
     if (engineRef.current) return true
@@ -151,6 +217,8 @@ export default function App() {
           setLoad({ load: m.load, peakLoad: m.peakLoad })
           setClockBpm(m.clockBpm)
           setLatencyMs(Math.round(latency()))
+          setOversample(m.oversample)
+          watchLoad(m.load, m.oversample)
         }
         if (m.type === 'transport') setPlaying(m.playing)
         if (m.type === 'error') setCrash(m.message)
@@ -158,6 +226,7 @@ export default function App() {
           partsRef.current.forEach((ps, voice) =>
             ps.forEach((p, index) => p.scale !== 1 && eng.send({ type: 'part', voice, index, scale: p.scale })),
           )
+          settle()
           setGen((g) => g + 1)
         }
       })
@@ -317,11 +386,63 @@ export default function App() {
     if (status === 'ready') send({ type: 'unit', seed: unit.seed, age: unit.age, temp: unit.temp })
   }, [status, unit, send, gen])
 
+  // Knobs as last sent to the engine of generation `gen`: a drag sends only the knob
+  // it moves, while a new engine (start or reset) gets every value.
+  const sentKnobsRef = useRef<{ gen: number; knobs: number[][] } | null>(null)
   useEffect(() => {
     if (status !== 'ready') return
-    knobs.forEach((vals, v) => vals.forEach((value, i) => send({ type: 'knob', voice: v, id: KNOBS[v][i].id, value })))
-    send({ type: 'getParts' })
+    const sent = sentKnobsRef.current?.gen === gen ? sentKnobsRef.current.knobs : null
+    knobs.forEach((vals, v) =>
+      vals.forEach((value, i) => {
+        if (sent?.[v]?.[i] !== value) send({ type: 'knob', voice: v, id: KNOBS[v][i].id, value })
+      }),
+    )
+    sentKnobsRef.current = { gen, knobs }
   }, [status, knobs, send, gen])
+
+  // Reading the parts walks every part of every voice, so it only happens while the
+  // table is open: at once when it opens, then after changes settle.
+  const partsShownRef = useRef(false)
+  useEffect(() => {
+    if (status !== 'ready' || !partsOpen) {
+      partsShownRef.current = false
+      return
+    }
+    const delay = partsShownRef.current ? PARTS_DEBOUNCE_MS : 0
+    partsShownRef.current = true
+    const t = window.setTimeout(() => send({ type: 'getParts' }), delay)
+    return () => window.clearTimeout(t)
+  }, [status, partsOpen, knobs, unit, partEdits, send, gen])
+
+  const setPartScale = (voice: number, index: number, scale: number) => {
+    send({ type: 'part', voice, index, scale })
+    // Show the new value right away; the engine's own reading follows after the debounce.
+    const next = partsRef.current.map((ps, v) =>
+      v !== voice
+        ? ps
+        : ps.map((p, i) => (i === index ? { ...p, scale, effective: (p.effective * scale) / p.scale } : p)),
+    )
+    partsRef.current = next
+    setParts(next)
+    setPartEdits((n) => n + 1)
+  }
+
+  useEffect(() => {
+    if (status !== 'ready') return
+    send({ type: 'oversample', factor })
+    settle()
+  }, [status, factor, send, gen])
+
+  useEffect(() => {
+    liveRef.current = { quality, autoLight, playing }
+    if (playing) settle()
+  }, [quality, autoLight, playing])
+
+  useEffect(() => {
+    const onVisibility = () => document.visibilityState === 'visible' && settle()
+    document.addEventListener('visibilitychange', onVisibility)
+    return () => document.removeEventListener('visibilitychange', onVisibility)
+  }, [])
 
   // Sound switches; a string key so cell edits do not resend them.
   const swKey = SWITCH_SLOTS.map((s) => pattern.sw[s]).join('')
@@ -455,6 +576,10 @@ export default function App() {
     </div>
   )
 
+  const loadNote = [oversample === 1 && '軽量', load.peakLoad >= 0 && `瞬間 ${Math.round(load.peakLoad * 100)}%`]
+    .filter(Boolean)
+    .join('・')
+
   if (status !== 'ready') {
     return (
       <main className="splash">
@@ -552,9 +677,18 @@ export default function App() {
             ))}
           </div>
           <span className={`meter ${load.peakLoad > 0.9 || load.load > 0.7 ? 'hot' : ''}`}>
-            負荷 {Math.round(load.load * 100)}%{load.peakLoad >= 0 && `（瞬間 ${Math.round(load.peakLoad * 100)}%）`}
+            負荷 {Math.round(load.load * 100)}%{loadNote && `（${loadNote}）`}
             ・遅延 {following ? latencyMs + MIDI_MARGIN_MS : latencyMs} ms
           </span>
+          {lightNotice && (
+            <span className="notice" role="status">
+              処理が追いつかないため軽量モードに切り替えました
+              <button onClick={() => chooseQuality('high')}>高品質に戻す</button>
+              <button className="ghost" onClick={() => setLightNotice(false)}>
+                閉じる
+              </button>
+            </span>
+          )}
           {status === 'ready' && ctxState !== 'running' && (
             <span className="stopped">
               {ctxState === 'stalled' ? '音の計算が止まっています' : `音の出力が止まりました（${ctxState}）`}
@@ -624,7 +758,7 @@ export default function App() {
         </div>
       </section>
 
-      <details className="parts">
+      <details className="parts" onToggle={(e) => setPartsOpen(e.currentTarget.open)}>
         <summary>詳細設定</summary>
         <div className="unit-controls">
           <label>
@@ -676,6 +810,20 @@ export default function App() {
               <option value="playback">安定</option>
             </select>
           </label>
+          <label>
+            音質
+            <select
+              className="quality"
+              value={quality}
+              disabled={oversample === 0}
+              title={oversample === 0 ? 'この音の計算エンジンでは切り替えられません' : undefined}
+              onChange={(e) => chooseQuality(e.currentTarget.value as Quality)}
+            >
+              <option value="auto">{autoLight ? '自動（いまは軽量）' : '自動（おすすめ）'}</option>
+              <option value="high">高品質（2 倍オーバーサンプル）</option>
+              <option value="light">軽量</option>
+            </select>
+          </label>
         </div>
         <div className="tabs">
           {VOICES.map((name, v) => (
@@ -692,7 +840,7 @@ export default function App() {
         )}
         <PartsTable
           parts={parts[partsVoice] ?? []}
-          onScale={(index, scale) => send({ type: 'part', voice: partsVoice, index, scale })}
+          onScale={(index, scale) => setPartScale(partsVoice, index, scale)}
         />
       </details>
       {footer}
