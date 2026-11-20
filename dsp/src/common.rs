@@ -142,6 +142,20 @@ impl Common {
         c
     }
 
+    /// Rebuild for a new internal sample rate with a silent mixer, keeping
+    /// part edits, levels, the accent knob and the rail voltage.
+    pub fn rebuild(&mut self, sr: f64, unit: &Unit) {
+        let mut c = Common::new(sr);
+        for (p, old) in c.pm.parts.iter_mut().zip(&self.pm.parts) {
+            p.user_scale = old.user_scale;
+        }
+        c.levels = self.levels;
+        c.accent_knob = self.accent_knob;
+        c.rail_v = self.rail_v;
+        c.refresh(unit);
+        *self = c;
+    }
+
     pub fn parts(&self) -> &[Part] {
         &self.pm.parts
     }
@@ -183,6 +197,7 @@ impl Common {
             accent: self.accent_knob * 1.25 * loading,
             rail: self.rail_v / RAIL_NOMINAL,
             metal: 0.0,
+            noise: 1.0,
         }
     }
 

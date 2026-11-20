@@ -176,14 +176,16 @@ impl Cymbal {
         pm.c(&mut c, s, o, "C11 output", K::Electrolytic, 1e-6);
         pm.r(&mut c, o, GND, "R17 load", 10e3);
 
+        let (env, out) = (e.build(sr), c.build(sr));
+        let sleep = Sleeper::new(sr, &[&env, &out]);
         let mut cy = Self {
             bp_lo: a.build(sr),
             bp_hi: b.build(sr),
-            env: e.build(sr),
-            out: c.build(sr),
+            env,
+            out,
             pm,
             pulse: Pulse::new(sr),
-            sleep: Sleeper::new(sr),
+            sleep,
             m_lo,
             m_hi,
             trig,
@@ -228,6 +230,7 @@ impl Voice for Cymbal {
     }
     fn refresh(&mut self, unit: &Unit) {
         self.pm.parts[self.p_vr_decay].nominal = VR_DECAY_MAX * audio_taper(self.knob_decay);
+        self.sleep.restore(&mut [&mut self.env, &mut self.out]);
         self.pm.refresh_all(
             &mut [
                 &mut self.bp_lo,
@@ -248,13 +251,20 @@ impl Voice for Cymbal {
             .set_resistance(self.e_leg_lo, pm.eff(self.p_leg_lo) + track * t);
         self.out
             .set_resistance(self.e_leg_hi, pm.eff(self.p_leg_hi) + track * (1.0 - t));
+        self.sleep.resume(&[&self.env, &self.out]);
     }
     fn trigger(&mut self, accent: f64, _variant: u32) {
+        #[cfg(test)]
+        if crate::voice::testing::restart_sources() {
+            // The band-passes follow the free-running oscillators.
+            self.bp_lo.rest();
+            self.bp_hi.rest();
+        }
         self.pulse.fire(accent);
-        self.sleep.wake();
+        self.sleep.wake(&mut [&mut self.env, &mut self.out]);
     }
     fn tick(&mut self, bus: &Bus) -> f64 {
-        if !self.sleep.awake {
+        if !self.sleep.awake() {
             return 0.0;
         }
         let m = bus.metal * 0.5;
@@ -284,25 +294,29 @@ impl Voice for Cymbal {
         self.out.set_voltage(self.v_mid, hi * vca_gain(em) * VCA_K);
         self.out.set_voltage(self.v_hi, hi * vca_gain(eh) * VCA_K);
         self.out.step();
-        // The oscillators never stop, so sleep follows the envelopes and the
-        // output network only.
-        if el.max(em).max(eh) > 0.21 {
-            self.sleep.wake();
-        } else {
-            self.sleep.observe(&[&self.out]);
-        }
-        self.out.v(self.o)
+        self.sleep.hear(self.out.v(self.o))
     }
     fn active(&self) -> bool {
-        self.sleep.awake
+        self.sleep.awake()
+    }
+    fn housekeep(&mut self) {
+        // Past the pulse the envelopes only fall, so the output only fades.
+        // The band-passes are left as they are while asleep.
+        self.sleep
+            .housekeep(&[&self.env, &self.out], !self.pulse.busy());
+    }
+    fn set_quiet(&mut self, volts: f64) {
+        self.sleep.set_threshold(volts);
     }
     fn accent_draw(&self) -> f64 {
         self.pulse.draw()
     }
     fn supply_current(&self) -> f64 {
         crate::voice::supply_draw(
-            self.sleep.awake,
-            &[&self.bp_lo, &self.bp_hi, &self.env, &self.out],
+            self.sleep.awake(),
+            // The band-passes follow the free-running oscillators: a
+            // steady load, part of the nominal rail.
+            &[&self.env, &self.out],
         )
     }
 }

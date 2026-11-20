@@ -120,13 +120,15 @@ impl RimClaves {
         pm.c(&mut cb2, cl, out_cl, "C11 claves output", K::FilmCap, 10e-9);
         pm.r(&mut cb2, out_cl, GND, "R15 claves load", 47e3);
 
+        let (rim, cl) = (cb.build(sr), cb2.build(sr));
+        let (sleep_rim, sleep_cl) = (Sleeper::new(sr, &[&rim]), Sleeper::new(sr, &[&cl]));
         let mut v = Self {
-            rim: cb.build(sr),
-            cl: cb2.build(sr),
+            rim,
+            cl,
             pm,
             pulse: Pulse::new(sr),
-            sleep_rim: Sleeper::new(sr),
-            sleep_cl: Sleeper::new(sr),
+            sleep_rim,
+            sleep_cl,
             trig_rim,
             trig_cl,
             out_rim,
@@ -155,41 +157,52 @@ impl Voice for RimClaves {
         self.pending = value == 1;
     }
     fn refresh(&mut self, unit: &Unit) {
+        self.sleep_rim.restore(&mut [&mut self.rim]);
+        self.sleep_cl.restore(&mut [&mut self.cl]);
         self.pm
             .refresh_all(&mut [&mut self.rim, &mut self.cl], unit, SALT);
+        self.sleep_rim.resume(&[&self.rim]);
+        self.sleep_cl.resume(&[&self.cl]);
     }
     fn trigger(&mut self, accent: f64, _variant: u32) {
         self.claves = self.pending;
         self.pulse.fire(accent);
         if self.claves {
-            self.sleep_cl.wake();
+            self.sleep_cl.wake(&mut [&mut self.cl]);
         } else {
-            self.sleep_rim.wake();
+            self.sleep_rim.wake(&mut [&mut self.rim]);
         }
     }
     fn tick(&mut self, bus: &Bus) -> f64 {
         let p = self.pulse.next(bus);
         let mut y = 0.0;
-        if self.sleep_rim.awake {
+        if self.sleep_rim.awake() {
             self.rim.rail = bus.rail;
             self.rim
                 .set_voltage(self.trig_rim, if self.claves { 0.0 } else { p });
             self.rim.step();
-            self.sleep_rim.observe(&[&self.rim]);
-            y += self.rim.v(self.out_rim);
+            y += self.sleep_rim.hear(self.rim.v(self.out_rim));
         }
-        if self.sleep_cl.awake {
+        if self.sleep_cl.awake() {
             self.cl.rail = bus.rail;
             self.cl
                 .set_voltage(self.trig_cl, if self.claves { p } else { 0.0 });
             self.cl.step();
-            self.sleep_cl.observe(&[&self.cl]);
-            y += self.cl.v(self.out_cl);
+            y += self.sleep_cl.hear(self.cl.v(self.out_cl));
         }
         y
     }
     fn active(&self) -> bool {
-        self.sleep_rim.awake || self.sleep_cl.awake
+        self.sleep_rim.awake() || self.sleep_cl.awake()
+    }
+    fn housekeep(&mut self) {
+        let idle = !self.pulse.busy();
+        self.sleep_rim.housekeep(&[&self.rim], idle);
+        self.sleep_cl.housekeep(&[&self.cl], idle);
+    }
+    fn set_quiet(&mut self, volts: f64) {
+        self.sleep_rim.set_threshold(volts);
+        self.sleep_cl.set_threshold(volts);
     }
     fn accent_draw(&self) -> f64 {
         self.pulse.draw()
@@ -247,7 +260,10 @@ mod tests {
                 });
                 v.set_switch(1);
                 v.trigger(1.0, 0);
-                for _ in 0..(sr * 0.4) as usize {
+                for i in 0..(sr * 0.4) as usize {
+                    if i % crate::voice::book_every(sr) == 0 {
+                        v.housekeep();
+                    }
                     v.tick(&Bus::default());
                 }
                 assert!(!v.active(), "seed {seed} age {age_years} temp {temp_c}");
@@ -261,9 +277,9 @@ mod tests {
         v.trigger(0.5, 0);
         v.set_switch(1);
         v.tick(&Bus::default());
-        assert!(v.sleep_rim.awake && !v.sleep_cl.awake);
+        assert!(v.sleep_rim.awake() && !v.sleep_cl.awake());
         v.trigger(0.5, 0);
         // The rim shot may finish; the claves now ring too.
-        assert!(v.sleep_rim.awake && v.sleep_cl.awake);
+        assert!(v.sleep_rim.awake() && v.sleep_cl.awake());
     }
 }

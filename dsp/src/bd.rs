@@ -149,11 +149,13 @@ impl BassDrum {
         let e = cb.resistor(n_outc, GND, 1.0);
         map.push((Target::R(e), part(&mut parts, "R10 load", K::Carbon, 10e3)));
 
+        let c = cb.build(sr);
+        let sleep = Sleeper::new(sr, &[&c]);
         let mut bd = Self {
-            c: cb.build(sr),
+            c,
             parts,
             pulse: Pulse::new(sr),
-            sleep: Sleeper::new(sr),
+            sleep,
             trig,
             map,
             diodes,
@@ -192,6 +194,7 @@ impl Voice for BassDrum {
         self.parts[self.vr_decay].nominal = VR_DECAY_MAX * (1.0 - self.knob_decay);
         self.parts[self.vr_tone].nominal = VR_TONE_MAX * (1.0 - self.knob_tone);
         apply_unit(&mut self.parts, unit, VOICE_ID);
+        self.sleep.restore(&mut [&mut self.c]);
         for &(t, pi) in &self.map {
             let v = self.parts[pi].effective;
             match t {
@@ -205,34 +208,42 @@ impl Voice for BassDrum {
             let p = &self.parts[pi];
             self.c.set_diode(id, p.effective, p.n, vt);
         }
+        self.sleep.resume(&[&self.c]);
     }
 
     fn trigger(&mut self, accent: f64, _variant: u32) {
         self.pulse.fire(accent);
-        self.sleep.wake();
+        self.sleep.wake(&mut [&mut self.c]);
     }
 
     fn tick(&mut self, bus: &Bus) -> f64 {
-        if !self.sleep.awake {
+        if !self.sleep.awake() {
             return 0.0;
         }
         let v = self.pulse.next(bus);
         self.c.set_voltage(self.trig, v);
         self.c.rail = bus.rail;
         self.c.step();
-        self.sleep.observe(&[&self.c]);
-        self.c.v(self.out)
+        self.sleep.hear(self.c.v(self.out))
     }
 
     fn active(&self) -> bool {
-        self.sleep.awake
+        self.sleep.awake()
+    }
+
+    fn housekeep(&mut self) {
+        self.sleep.housekeep(&[&self.c], !self.pulse.busy());
+    }
+
+    fn set_quiet(&mut self, volts: f64) {
+        self.sleep.set_threshold(volts);
     }
 
     fn accent_draw(&self) -> f64 {
         self.pulse.draw()
     }
     fn supply_current(&self) -> f64 {
-        crate::voice::supply_draw(self.sleep.awake, &[&self.c])
+        crate::voice::supply_draw(self.sleep.awake(), &[&self.c])
     }
 }
 

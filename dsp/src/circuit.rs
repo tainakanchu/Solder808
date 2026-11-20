@@ -217,6 +217,10 @@ impl CircuitBuilder {
             dense_only: false,
             lu: vec![0.0; size * size],
             bp: vec![0.0; size],
+            dc: vec![0.0; size],
+            dc_mark: vec![0.0; size],
+            dc_work: vec![0.0; size],
+            euler: false,
             dirty: true,
             last_iters: 0,
             replans: 0,
@@ -256,6 +260,7 @@ fn update_vcrit(e: &mut Elem) {
     }
 }
 
+#[derive(Clone)]
 pub struct Circuit {
     nn: usize,
     size: usize,
@@ -307,6 +312,16 @@ pub struct Circuit {
     pub(crate) dense_only: bool,
     lu: Vec<f64>,
     bp: Vec<f64>,
+    /// Rest point: the last DC operating point settled on (all zeros for a
+    /// circuit without standing bias), the one marked before a change, and
+    /// scratch for the DC Newton.
+    dc: Vec<f64>,
+    dc_mark: Vec<f64>,
+    dc_work: Vec<f64>,
+    /// Integrate capacitors with backward Euler instead of the trapezoidal
+    /// rule (coarse coasting copies: L-stable, so modes far faster than the
+    /// long time step die out instead of ringing at its Nyquist).
+    euler: bool,
     dirty: bool,
     pub last_iters: usize,
     /// Number of times the sparse plan was rebuilt (diagnostics).
@@ -314,14 +329,30 @@ pub struct Circuit {
 }
 
 impl Circuit {
-    pub fn set_sample_rate(&mut self, sr: f64) {
-        self.dt = 1.0 / sr;
-        for e in &mut self.elems {
-            if let Elem::C { c, geq, .. } = e {
-                *geq = 2.0 * *c / self.dt;
+    /// Companion conductance of a capacitor at the present time step.
+    fn geq(&self, c: f64) -> f64 {
+        if self.euler {
+            c / self.dt
+        } else {
+            2.0 * c / self.dt
+        }
+    }
+
+    fn update_geq(&mut self) {
+        for i in 0..self.elems.len() {
+            if let Elem::C { c, .. } = self.elems[i] {
+                let g = self.geq(c);
+                if let Elem::C { geq, .. } = &mut self.elems[i] {
+                    *geq = g;
+                }
             }
         }
         self.dirty = true;
+    }
+
+    pub fn set_sample_rate(&mut self, sr: f64) {
+        self.dt = 1.0 / sr;
+        self.update_geq();
     }
 
     pub fn set_resistance(&mut self, id: ElemId, ohms: f64) {
@@ -335,11 +366,11 @@ impl Circuit {
     }
 
     pub fn set_capacitance(&mut self, id: ElemId, farads: f64) {
-        let dt = self.dt;
+        let g = self.geq(farads.max(1e-15));
         if let Elem::C { c, geq, .. } = &mut self.elems[id.0] {
             if *c != farads {
                 *c = farads.max(1e-15);
-                *geq = 2.0 * *c / dt;
+                *geq = g;
                 self.dirty = true;
             }
         }
@@ -379,53 +410,194 @@ impl Circuit {
         self.nn
     }
 
-    /// Largest absolute node voltage; used to decide when a voice is silent.
+    /// Largest node voltage away from the rest point (0 V unless a DC
+    /// operating point was settled); used for supply draw and sleeping.
     pub fn energy(&self) -> f64 {
-        self.x[..self.nn].iter().fold(0.0f64, |m, v| m.max(v.abs()))
+        self.x[..self.nn]
+            .iter()
+            .zip(&self.dc)
+            .fold(0.0f64, |m, (v, d)| m.max((v - d).abs()))
+    }
+
+    /// A copy of this circuit stepping `factor` samples at a time with
+    /// backward Euler, for [`Circuit::coast_from`]. Allocates; call when
+    /// building a voice.
+    pub fn coarse(&self, factor: usize) -> Circuit {
+        let mut c = self.clone();
+        c.euler = true;
+        c.set_sample_rate(1.0 / (self.dt * factor as f64));
+        c
+    }
+
+    /// Take over `fine`'s element values and state (same topology, any time
+    /// step) with every voltage source at rest (0 V), so this circuit carries
+    /// on decaying from where `fine` stopped. Does not allocate.
+    pub fn coast_from(&mut self, fine: &Circuit) {
+        self.elems.copy_from_slice(&fine.elems);
+        for e in &mut self.elems {
+            if let Elem::V { v, .. } = e {
+                *v = 0.0;
+            }
+        }
+        self.update_geq();
+        self.x.copy_from_slice(&fine.x);
+        self.x_prev.copy_from_slice(&fine.x);
+        self.rail = fine.rail;
+        // The point it decays to (the fine circuit's may have been found at
+        // another rail voltage, which a standing bias follows).
+        self.dc.copy_from_slice(&fine.dc);
+        self.solve_dc();
+    }
+
+    /// Load the dynamic state (node voltages, capacitor history, nonlinear
+    /// linearization points) of `other`, a copy of this circuit at another
+    /// time step. Element values stay this circuit's own.
+    pub fn load_state(&mut self, other: &Circuit) {
+        for (e, o) in self.elems.iter_mut().zip(&other.elems) {
+            match (e, o) {
+                (
+                    Elem::C { v_prev, i_prev, .. },
+                    Elem::C {
+                        v_prev: v,
+                        i_prev: i,
+                        ..
+                    },
+                ) => {
+                    *v_prev = *v;
+                    *i_prev = *i;
+                }
+                (Elem::D { vd, lin, .. }, Elem::D { vd: v, lin: l, .. })
+                | (Elem::OpAmp { vd, lin, .. }, Elem::OpAmp { vd: v, lin: l, .. }) => {
+                    *vd = *v;
+                    *lin = *l;
+                }
+                _ => {}
+            }
+        }
+        self.x.copy_from_slice(&other.x);
+        // No velocity for the predictor: `other`'s last step was not ours.
+        self.x_prev.copy_from_slice(&other.x);
     }
 
     fn rebuild_linear(&mut self) {
-        let n = self.size;
-        let nn = self.nn;
-        let a = &mut self.a_lin;
-        a.iter_mut().for_each(|v| *v = 0.0);
-        for i in 0..nn {
-            a[i * n + i] += GMIN;
-        }
-        for e in &self.elems {
-            match *e {
-                Elem::R { a: p, b: q, g } => stamp_g(a, n, p, q, g),
-                Elem::I { .. } => {}
-                Elem::C {
-                    a: p, b: q, geq, ..
-                } => stamp_g(a, n, p, q, geq),
-                Elem::V {
-                    a: p, b: q, row, ..
-                } => {
-                    let r = nn + row;
-                    if p != GND {
-                        a[(p - 1) * n + r] += 1.0;
-                        a[r * n + p - 1] += 1.0;
-                    }
-                    if q != GND {
-                        a[(q - 1) * n + r] -= 1.0;
-                        a[r * n + q - 1] -= 1.0;
-                    }
-                }
-                Elem::OpAmp { out, row, .. } => {
-                    let r = nn + row;
-                    a[(out - 1) * n + r] += 1.0;
-                    a[r * n + out - 1] += 1.0;
-                }
-                Elem::D { .. } => {}
-            }
-        }
+        stamp_linear(&self.elems, &mut self.a_lin, self.size, self.nn, true);
         // Nonlinear elements at their nominal values.
         for t in &self.nl {
-            t.stamp(a, n, t.c0);
+            t.stamp(&mut self.a_lin, self.size, t.c0);
         }
         self.dirty = false;
         self.lowrank = false;
+    }
+
+    /// DC operating point (capacitors open, sources at their present values)
+    /// by Newton on the dense matrix, starting from the last one found.
+    /// Leaves it in `dc`; false (and `dc` untouched) if it did not converge.
+    fn solve_dc(&mut self) -> bool {
+        let (n, nn, m) = (self.size, self.nn, self.nl.len());
+        self.dc_work.copy_from_slice(&self.dc);
+        for _ in 0..200 {
+            stamp_linear(&self.elems, &mut self.a, n, nn, false);
+            self.a_stale = true;
+            self.b.iter_mut().for_each(|v| *v = 0.0);
+            for &i in &self.srcs {
+                match self.elems[i] {
+                    Elem::V { v, row, .. } => self.b[nn + row] = v,
+                    Elem::I { a: p, b: q, i } => stamp_i(&mut self.b, q, p, i),
+                    _ => {}
+                }
+            }
+            let mut limited = false;
+            for j in 0..m {
+                let raw = self.nl[j].vdot(&self.dc_work) * self.nl[j].vsign;
+                let (lim, beta) = self.linearize(j, raw);
+                limited |= lim;
+                self.nl[j].stamp(&mut self.a, n, self.cval[j]);
+                for &(i, sgn) in self.nl[j].u() {
+                    self.b[i] += sgn * beta;
+                }
+            }
+            if !solve(&mut self.a, &mut self.b, &mut self.perm, n) {
+                return false;
+            }
+            let mut delta = 0.0f64;
+            for (d, &v) in self.dc_work.iter_mut().zip(&self.b) {
+                delta = delta.max((v - *d).abs());
+                *d = v;
+            }
+            let scale = 1.0 + self.dc_work.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+            if !limited && delta <= 1e-13 * scale {
+                self.dc.copy_from_slice(&self.dc_work);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Remember the present DC operating point, before element values change,
+    /// for a following [`Circuit::settle_dc`].
+    pub fn mark_dc(&mut self) {
+        if self.solve_dc() {
+            self.dc_mark.copy_from_slice(&self.dc);
+        } else {
+            self.dc_mark.iter_mut().for_each(|v| *v = f64::NAN);
+        }
+    }
+
+    /// Move the circuit onto the DC operating point of its present element
+    /// values and sources, without time-stepping. With `reset` (a silent
+    /// circuit) the whole state becomes that point. Otherwise the change since
+    /// [`Circuit::mark_dc`] is added to the state, so a ringing circuit keeps
+    /// ringing around the new point instead of being kicked by the step.
+    pub fn settle_dc(&mut self, reset: bool) {
+        if !self.solve_dc() {
+            return;
+        }
+        let shift = !reset && self.dc_mark.iter().all(|v| v.is_finite());
+        self.place(shift);
+        self.dc_mark.copy_from_slice(&self.dc);
+    }
+
+    /// Put the whole state on the rest point (no transient left).
+    #[cfg(test)]
+    pub fn rest(&mut self) {
+        self.place(false);
+    }
+
+    /// State onto the rest point `dc`, or (`shift`) moved by its change
+    /// since `dc_mark`.
+    fn place(&mut self, shift: bool) {
+        for k in 0..self.size {
+            let (new, old) = (self.dc[k], self.dc_mark[k]);
+            if shift {
+                self.x[k] += new - old;
+                self.x_prev[k] += new - old;
+            } else {
+                self.x[k] = new;
+                self.x_prev[k] = new;
+            }
+        }
+        for &i in &self.caps {
+            if let Elem::C {
+                a: p,
+                b: q,
+                v_prev,
+                i_prev,
+                ..
+            } = &mut self.elems[i]
+            {
+                *v_prev = node_v(&self.x, *p) - node_v(&self.x, *q);
+                if !shift {
+                    *i_prev = 0.0;
+                }
+            }
+        }
+        for t in &self.nl {
+            let v = t.vsign * t.vdot(&self.x);
+            match &mut self.elems[t.elem] {
+                Elem::D { vd, .. } | Elem::OpAmp { vd, .. } => *vd = v,
+                _ => {}
+            }
+        }
     }
 
     /// Factor `a_lin` and precompute Z and W. Leaves `lowrank` false (so the
@@ -609,6 +781,7 @@ impl Circuit {
             self.setup_lowrank();
         }
         // Capacitor history currents for this step.
+        let euler = self.euler;
         for &i in &self.caps {
             if let Elem::C {
                 geq,
@@ -618,7 +791,7 @@ impl Circuit {
                 ..
             } = &mut self.elems[i]
             {
-                *j = *geq * *v_prev + *i_prev;
+                *j = *geq * *v_prev + if euler { 0.0 } else { *i_prev };
             }
         }
         // Linearize the first iteration at the solution extrapolated from the
@@ -907,6 +1080,7 @@ fn dot(a: &[f64], b: &[f64]) -> f64 {
 }
 
 /// A nonlinear element as the rank-one matrix term c·u·vᵀ (matrix indices).
+#[derive(Clone)]
 struct RankOne {
     /// Index in `elems`.
     elem: usize,
@@ -1047,6 +1221,42 @@ fn node_v(x: &[f64], n: Node) -> f64 {
     }
 }
 
+/// Stamp the linear elements (capacitors as their trapezoidal conductance,
+/// or open when `caps` is false) into `a`, which is cleared first.
+fn stamp_linear(elems: &[Elem], a: &mut [f64], n: usize, nn: usize, caps: bool) {
+    a.iter_mut().for_each(|v| *v = 0.0);
+    for i in 0..nn {
+        a[i * n + i] += GMIN;
+    }
+    for e in elems {
+        match *e {
+            Elem::R { a: p, b: q, g } => stamp_g(a, n, p, q, g),
+            Elem::C {
+                a: p, b: q, geq, ..
+            } if caps => stamp_g(a, n, p, q, geq),
+            Elem::V {
+                a: p, b: q, row, ..
+            } => {
+                let r = nn + row;
+                if p != GND {
+                    a[(p - 1) * n + r] += 1.0;
+                    a[r * n + p - 1] += 1.0;
+                }
+                if q != GND {
+                    a[(q - 1) * n + r] -= 1.0;
+                    a[r * n + q - 1] -= 1.0;
+                }
+            }
+            Elem::OpAmp { out, row, .. } => {
+                let r = nn + row;
+                a[(out - 1) * n + r] += 1.0;
+                a[r * n + out - 1] += 1.0;
+            }
+            Elem::C { .. } | Elem::I { .. } | Elem::D { .. } => {}
+        }
+    }
+}
+
 #[inline]
 fn stamp_g(a: &mut [f64], n: usize, p: Node, q: Node, g: f64) {
     if p != GND {
@@ -1094,6 +1304,7 @@ fn pnjlim(vnew: f64, vold: f64, nvt: f64, vcrit: f64) -> f64 {
 /// lists over the structural non-zeros (fill-in included) of the permuted
 /// matrix. A solve touches only those entries, in compact storage, so its
 /// cost follows the number of non-zeros instead of n².
+#[derive(Clone)]
 struct LuPlan {
     /// Row `r` of the permuted system is row `perm[r]` of the original.
     perm: Vec<usize>,

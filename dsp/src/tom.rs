@@ -127,10 +127,9 @@ pub struct TomConga {
     p_stand: usize,
     vr_tom: f64,
     vr_conga: f64,
-    /// Nodes watched by the sleeper: ones that rest at exactly 0 V (the diode
-    /// bias holds the ground leg, the bridge middle and the pitch envelope at
-    /// a standing DC level, so they never go quiet).
-    watch: [Node; 3],
+    /// Op-amp output (tests).
+    #[cfg(test)]
+    o: Node,
     /// Noise filter nodes (to tell when the burst has died away).
     filt: [Node; 3],
     out: Node,
@@ -232,13 +231,17 @@ impl TomConga {
         pm.r(&mut nb, nout, GND, "R13 noise HPF", 10e3);
         pm.c(&mut nb, nout, GND, "C11 noise LPF", K::Ceramic, 22e-9);
 
+        // The noise circuit is not coasted: `nz_live` stops it, the same way
+        // whether or not the body sleeps.
+        let c = cb.build(sr);
+        let sleep = Sleeper::new(sr, &[&c]);
         let mut t = Self {
-            c: cb.build(sr),
+            c,
             nz: nb.build(sr),
             pm,
             pulse: Pulse::new(sr),
-            sleep: Sleeper::new(sr),
-            noise: Noise(spec.noise_seed),
+            sleep,
+            noise: Noise::new(spec.noise_seed),
             salt: spec.salt,
             trig,
             ntrig,
@@ -261,7 +264,8 @@ impl TomConga {
             p_stand,
             vr_tom: spec.vr_tom,
             vr_conga: spec.vr_conga,
-            watch: [o, out, inv],
+            #[cfg(test)]
+            o,
             filt: [n1, n2, nout],
             out,
             nenv,
@@ -273,19 +277,7 @@ impl TomConga {
             knob_conga: 0.5,
         };
         t.refresh(&Unit::default());
-        t.power_on(sr);
         t
-    }
-
-    /// Let the diode's standing bias charge the bridge capacitors before the
-    /// first note, with the bridge heavily damped so the step does not ring.
-    fn power_on(&mut self, sr: f64) {
-        self.c.set_resistance(self.e_rf, 1e3);
-        self.set_bias(1.0);
-        for _ in 0..(sr * 0.02) as usize {
-            self.c.step();
-        }
-        self.c.set_resistance(self.e_rf, self.pm.eff(self.p_rf));
     }
 
     fn set_bias(&mut self, rail: f64) {
@@ -332,23 +324,36 @@ impl Voice for TomConga {
         self.pending = value == 1;
     }
     fn refresh(&mut self, unit: &Unit) {
+        // The diode's standing bias holds the bridge capacitors and the bias
+        // network at a DC operating point that moves with the parts and the
+        // temperature. Solve it directly (trigger line at rest): a silent
+        // voice is put on it, a ringing one is shifted by the change so it
+        // keeps ringing around the new point with no thump.
+        self.sleep.restore(&mut [&mut self.c]);
+        self.c.set_voltage(self.trig, 0.0);
+        self.set_bias(self.c.rail);
+        self.c.mark_dc();
         self.pm.parts[self.p_vrt].nominal = self.vr_tom * (1.0 - self.knob_tom);
         self.pm.parts[self.p_vrc].nominal = self.vr_conga * (1.0 - self.knob_conga);
         self.pm
             .refresh_all(&mut [&mut self.c, &mut self.nz], unit, self.salt);
         self.c.set_resistance(self.e_rf, self.pm.eff(self.p_rf));
         self.apply_mode();
+        self.set_bias(self.c.rail);
+        self.c.settle_dc(self.sleep.resting());
+        self.sleep.resume(&[&self.c]);
     }
     fn trigger(&mut self, accent: f64, _variant: u32) {
         if self.pending != self.conga {
             self.conga = self.pending;
             self.apply_mode();
         }
+        self.noise.strike();
         self.pulse.fire(accent);
-        self.sleep.wake();
+        self.sleep.wake(&mut [&mut self.c]);
     }
     fn tick(&mut self, bus: &Bus) -> f64 {
-        if !self.sleep.awake {
+        if !self.sleep.awake() {
             return 0.0;
         }
         let p = self.pulse.next(bus);
@@ -365,7 +370,7 @@ impl Voice for TomConga {
             // after it while the gain moves slowly next to the filter's
             // sub-ms time constants, and it lets the filter go quiet.
             let g = vca_gain(self.nz.v(self.nenv));
-            let n = self.noise.tick();
+            let n = self.noise.tick() * bus.noise;
             self.nz.rail = bus.rail;
             self.nz.set_voltage(self.ntrig, p);
             self.nz.set_voltage(self.nsrc, n * g * NOISE_DRIVE);
@@ -377,21 +382,23 @@ impl Voice for TomConga {
                 .fold(0.0f64, |m, &k| m.max(self.nz.v(k).abs()));
             self.nz_live = p > 0.0 || self.nz.v(self.nenv) > 0.05 || filt > 1e-6;
         }
-        let level = self.watch.iter().fold(
-            if self.nz_live { self.nz.energy() } else { 0.0 },
-            |m, &n| m.max(self.c.v(n).abs()),
-        );
-        self.sleep.observe_level(level);
-        self.c.v(self.out) + noise * NOISE_MIX
+        self.sleep.hear(self.c.v(self.out) + noise * NOISE_MIX)
     }
     fn active(&self) -> bool {
-        self.sleep.awake
+        self.sleep.awake()
+    }
+    fn housekeep(&mut self) {
+        let idle = !self.pulse.busy() && !self.nz_live;
+        self.sleep.housekeep(&[&self.c], idle);
+    }
+    fn set_quiet(&mut self, volts: f64) {
+        self.sleep.set_threshold(volts);
     }
     fn accent_draw(&self) -> f64 {
         self.pulse.draw()
     }
     fn supply_current(&self) -> f64 {
-        crate::voice::supply_draw(self.sleep.awake, &[&self.c, &self.nz])
+        crate::voice::supply_draw(self.sleep.awake(), &[&self.c, &self.nz])
     }
 }
 
@@ -437,7 +444,7 @@ mod tests {
                 let mut peak = 0.0f64;
                 for _ in 0..(SR * 0.3) as usize {
                     t.tick(&Bus::default());
-                    peak = peak.max(t.c.v(t.watch[0]).abs());
+                    peak = peak.max(t.c.v(t.o).abs());
                 }
                 let salt = spec.salt;
                 assert!(peak > 2.0 && peak < 8.5, "{salt} conga {conga}: {peak}");
@@ -489,6 +496,97 @@ mod tests {
                     "{salt} conga {conga}: {early} then {late}"
                 );
             }
+        }
+    }
+
+    /// Body peak (no noise) of one hit, then ring out for `secs`.
+    fn body_peak(t: &mut TomConga, secs: f64) -> f64 {
+        t.trigger(0.5, 0);
+        let mut peak = 0.0f64;
+        for i in 0..(secs * SR) as usize {
+            if i % crate::voice::book_every(SR) == 0 {
+                t.housekeep();
+            }
+            t.tick(&Bus::default());
+            peak = peak.max(t.c.v(t.out).abs());
+        }
+        peak
+    }
+
+    /// The standing-bias operating point follows unit changes: the first hit
+    /// after one matches the later ones (it used to start from the old
+    /// point, up to 6 dB off).
+    #[test]
+    fn first_hit_after_a_unit_change_matches_later_ones() {
+        let units = [
+            (0, 0.0, 0.0),
+            (0, 0.0, 45.0),
+            (9, 40.0, 25.0),
+            (3, 10.0, 5.0),
+            (21, 50.0, 40.0),
+        ];
+        for spec in [&LOW, &MID, &HIGH] {
+            for conga in [false, true] {
+                for (seed, age_years, temp_c) in units {
+                    let mut t = TomConga::new(SR, spec);
+                    t.set_switch(conga as u32);
+                    // Ring once at the default unit, then change it at rest.
+                    body_peak(&mut t, 4.0);
+                    assert!(!t.active());
+                    t.refresh(&Unit {
+                        seed,
+                        age_years,
+                        temp_c,
+                    });
+                    let first = body_peak(&mut t, 4.0);
+                    let later = body_peak(&mut t, 4.0);
+                    let db = 20.0 * (first / later).log10();
+                    let salt = spec.salt;
+                    assert!(
+                        db.abs() < 0.1,
+                        "{salt} conga {conga} unit {seed}/{age_years}/{temp_c}: {first} vs {later}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Changing the temperature while a note rings must not thump: the
+    /// output keeps following the unchanged note closely.
+    #[test]
+    fn unit_change_while_ringing_does_not_thump() {
+        for temp_c in [0.0, 45.0] {
+            let mut a = TomConga::new(SR, &LOW);
+            let mut b = TomConga::new(SR, &LOW);
+            for t in [&mut a, &mut b] {
+                t.trigger(0.5, 0);
+                for _ in 0..(0.3 * SR) as usize {
+                    t.tick(&Bus::default());
+                }
+            }
+            a.refresh(&Unit {
+                temp_c,
+                ..Unit::default()
+            });
+            // The pitch moves a little with temperature, so the two drift
+            // apart in phase; a thump would show as a slow offset between
+            // them (the mean difference over windows of two periods).
+            let (mut ring, mut thump, mut sum) = (0.0f64, 0.0f64, 0.0);
+            let win = (0.0235 * SR) as usize;
+            for i in 1..=(0.1 * SR) as usize {
+                a.tick(&Bus::default());
+                b.tick(&Bus::default());
+                ring = ring.max(b.c.v(b.out).abs());
+                sum += a.c.v(a.out) - b.c.v(b.out);
+                if i % win == 0 {
+                    thump = thump.max((sum / win as f64).abs());
+                    sum = 0.0;
+                }
+            }
+            assert!(
+                thump < 0.02 * ring,
+                "{temp_c}: offset {thump} vs ring {ring}"
+            );
         }
     }
 

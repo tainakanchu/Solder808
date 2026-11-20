@@ -117,21 +117,23 @@ impl Clap {
         pm.c(&mut mb, h1, ma_out, "C8 MA HPF", K::FilmCap, 2.2e-9);
         pm.r(&mut mb, ma_out, GND, "R11 MA HPF", 15e3);
 
+        let (c, ma) = (cb.build(sr), mb.build(sr));
+        let (sleep, ma_sleep) = (Sleeper::new(sr, &[&c]), Sleeper::new(sr, &[&ma]));
         let mut cp = Self {
-            ma: mb.build(sr),
-            ma_sleep: Sleeper::new(sr),
+            ma,
+            ma_sleep,
             ma_pulse: Pulse::new(sr),
-            ma_noise: Noise(0x5851_f42d),
+            ma_noise: Noise::new(0x5851_f42d),
             ma_trig,
             ma_src,
             ma_env,
             ma_out,
             maracas: false,
             pending: false,
-            c: cb.build(sr),
+            c,
             pm,
-            sleep: Sleeper::new(sr),
-            noise: Noise(0x9e37_79b9),
+            sleep,
+            noise: Noise::new(0x9e37_79b9),
             sr,
             src,
             trig_burst,
@@ -169,34 +171,51 @@ impl Voice for Clap {
     }
     fn refresh(&mut self, unit: &Unit) {
         self.pm.parts[self.vr_tail].nominal = VR_TAIL_MAX * self.knob_tail;
+        self.sleep.restore(&mut [&mut self.c]);
+        self.ma_sleep.restore(&mut [&mut self.ma]);
         self.pm
             .refresh_all(&mut [&mut self.c, &mut self.ma], unit, VOICE_ID);
         let r = self.pm.parts[self.vr_tail - 1].effective + self.pm.parts[self.vr_tail].effective;
         self.c.set_resistance(self.r_tail, r);
+        self.sleep.resume(&[&self.c]);
+        self.ma_sleep.resume(&[&self.ma]);
     }
     fn trigger(&mut self, accent: f64, _variant: u32) {
         self.maracas = self.pending;
         if self.maracas {
+            self.ma_noise.strike();
             self.ma_pulse.fire(accent);
-            self.ma_sleep.wake();
+            self.ma_sleep.wake(&mut [&mut self.ma]);
         } else {
+            self.noise.strike();
             self.t = 0;
             self.level = accent.clamp(0.0, 1.0);
-            self.sleep.wake();
+            self.sleep.wake(&mut [&mut self.c]);
         }
     }
     fn tick(&mut self, bus: &Bus) -> f64 {
         let mut y = 0.0;
-        if self.ma_sleep.awake {
-            y += self.tick_maracas(bus);
+        if self.ma_sleep.awake() {
+            let m = self.tick_maracas(bus);
+            y += self.ma_sleep.hear(m);
         }
-        if self.sleep.awake {
-            y += self.tick_clap(bus);
+        if self.sleep.awake() {
+            let c = self.tick_clap(bus);
+            y += self.sleep.hear(c);
         }
         y
     }
     fn active(&self) -> bool {
-        self.sleep.awake || self.ma_sleep.awake
+        self.sleep.awake() || self.ma_sleep.awake()
+    }
+    fn housekeep(&mut self) {
+        // Past the pulses the envelopes only fall, so the output only fades.
+        self.sleep.housekeep(&[&self.c], self.t == u32::MAX);
+        self.ma_sleep.housekeep(&[&self.ma], !self.ma_pulse.busy());
+    }
+    fn set_quiet(&mut self, volts: f64) {
+        self.sleep.set_threshold(volts);
+        self.ma_sleep.set_threshold(volts);
     }
     fn accent_draw(&self) -> f64 {
         self.ma_pulse.draw() + if self.pulsing { self.level } else { 0.0 }
@@ -210,13 +229,12 @@ impl Clap {
     fn tick_maracas(&mut self, bus: &Bus) -> f64 {
         let p = self.ma_pulse.next(bus);
         let g = vca_gain(self.ma.v(self.ma_env));
-        let n = self.ma_noise.tick();
+        let n = self.ma_noise.tick() * bus.noise;
         self.ma.rail = bus.rail;
         self.ma.set_voltage(self.ma_trig, p);
         // VCA ahead of the linear high-pass, as on the clap.
         self.ma.set_voltage(self.ma_src, n * g * MA_DRIVE);
         self.ma.step();
-        self.ma_sleep.observe(&[&self.ma]);
         self.ma.v(self.ma_out)
     }
 
@@ -241,14 +259,13 @@ impl Clap {
         }
         let g = vca_gain(self.c.v(self.env_burst)) * 6.0 + vca_gain(self.c.v(self.env_tail)) * 3.0;
         // VCA ahead of the filter keeps the noise silent between hits.
-        let n = self.noise.tick();
+        let n = self.noise.tick() * bus.noise;
         self.c.set_voltage(self.src, n * g * 0.25);
         self.c.set_voltage(self.trig_burst, burst);
         self.c.set_voltage(self.trig_tail, tail);
         self.pulsing = burst > 0.0 || tail > 0.0;
         self.c.rail = bus.rail;
         self.c.step();
-        self.sleep.observe(&[&self.c]);
         self.c.v(self.out)
     }
 }

@@ -227,15 +227,37 @@ fn blep(t: f64, dt: f64) -> f64 {
 }
 
 /// xorshift32 white noise in [-1, 1).
-pub struct Noise(pub u32);
+pub struct Noise {
+    state: u32,
+    #[cfg(test)]
+    seed: u32,
+}
 
 impl Noise {
+    pub fn new(seed: u32) -> Self {
+        Self {
+            state: seed,
+            #[cfg(test)]
+            seed,
+        }
+    }
+
     pub fn tick(&mut self) -> f64 {
-        let mut x = self.0;
+        let mut x = self.state;
         x ^= x << 13;
         x ^= x >> 17;
         x ^= x << 5;
-        self.0 = x;
+        self.state = x;
         (x as f64 / u32::MAX as f64) * 2.0 - 1.0
+    }
+
+    /// Called on every trigger. Tests can make each note start the sequence
+    /// over, so runs that differ only in how long a voice was awake between
+    /// notes can be compared sample for sample.
+    pub fn strike(&mut self) {
+        #[cfg(test)]
+        if crate::voice::testing::restart_sources() {
+            self.state = self.seed;
+        }
     }
 }
