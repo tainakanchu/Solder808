@@ -64,6 +64,12 @@ class Solder808Processor extends AudioWorkletProcessor {
   private lastTickFrame = -1
   private tickLen = 0
   private queue: { frame: number; step: number }[] = []
+  // A clock may start playback without Start/Continue (joining a running
+  // sequence); cleared by Stop or a manual stop so a free-running clock
+  // does not restart it.
+  private joinable = false
+  // A song position arrived since playback last started.
+  private sppSet = false
 
   constructor(options: { processorOptions: { wasm: ArrayBuffer } }) {
     super()
@@ -119,12 +125,15 @@ class Solder808Processor extends AudioWorkletProcessor {
           this.untilStep = 0
         }
         if (!m.playing) this.rollLeft.fill(0)
+        if (this.playing && !m.playing) this.joinable = false
         this.playing = m.playing
         break
       case 'getParts':
         this.sendParts()
         break
       case 'sync':
+        // Re-sent after an engine reset; only a mode change re-arms joining.
+        if (m.mode !== this.sync) this.joinable = m.mode === 'midi'
         this.sync = m.mode
         this.queue = []
         this.tickLen = 0
@@ -133,6 +142,7 @@ class Solder808Processor extends AudioWorkletProcessor {
         break
       case 'spp':
         this.tick = m.pos * 6 - 1
+        this.sppSet = true
         break
       case 'midi':
         this.onMidi(m.kind, m.frame)
@@ -147,10 +157,13 @@ class Solder808Processor extends AudioWorkletProcessor {
       this.queue = []
       this.rollLeft.fill(0)
       this.playing = true
+      this.sppSet = false
     } else if (kind === 'continue') {
       this.playing = true
+      this.sppSet = false
     } else if (kind === 'stop') {
       this.playing = false
+      this.joinable = false
       this.queue = []
       this.rollLeft.fill(0)
     } else {
@@ -159,7 +172,16 @@ class Solder808Processor extends AudioWorkletProcessor {
         if (dt > 0 && dt < sampleRate * 0.25) this.tickLen = this.tickLen ? this.tickLen * 0.9 + dt * 0.1 : dt
       }
       this.lastTickFrame = frame
-      if (!this.playing) return
+      if (!this.playing) {
+        if (!this.joinable) return
+        // Join mid-song: at the song position if one came, else this tick is the downbeat.
+        if (!this.sppSet) this.tick = -1
+        this.sppSet = false
+        this.queue = []
+        this.rollLeft.fill(0)
+        this.playing = true
+        this.send({ type: 'transport', playing: true })
+      }
       this.tick += 1
       if (this.tick % 6 !== 0) return
       const step = (this.tick / 6) % this.length

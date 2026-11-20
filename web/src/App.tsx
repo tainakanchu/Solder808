@@ -97,9 +97,10 @@ export default function App() {
   const partsRef = useRef<PartInfo[][]>([])
   // 'internal' or the id of the MIDI input whose clock is followed.
   const [syncInput, setSyncInput] = useState('internal')
-  const [midiInputs, setMidiInputs] = useState<{ id: string; name: string }[] | null>(null)
+  const [midiInputs, setMidiInputs] = useState<{ id: string; name: string }[] | 'denied' | null>(null)
   const [clockBpm, setClockBpm] = useState(-1)
   const midiRef = useRef<MIDIAccess | null>(null)
+  const syncRef = useRef('internal')
   const following = syncInput !== 'internal'
 
   const send = useCallback((m: ToWorklet) => engineRef.current?.send(m), [])
@@ -126,6 +127,7 @@ export default function App() {
           setClockBpm(m.clockBpm)
           setLatencyMs(Math.round(latency()))
         }
+        if (m.type === 'transport') setPlaying(m.playing)
         if (m.type === 'error') setCrash(m.message)
         if (m.type === 'reset') {
           partsRef.current.forEach((ps, voice) =>
@@ -203,6 +205,7 @@ export default function App() {
       midiRef.current?.inputs.forEach((input) => {
         input.onmidimessage = input.id === id ? onMidiMessage : null
       })
+      syncRef.current = id
       setSyncInput(id)
     },
     [onMidiMessage],
@@ -217,12 +220,22 @@ export default function App() {
       const access = await navigator.requestMIDIAccess()
       midiRef.current = access
       const list = () => [...access.inputs.values()].map((i) => ({ id: i.id, name: i.name ?? i.id }))
-      access.onstatechange = () => setMidiInputs(list())
       const inputs = list()
+      let count = inputs.length
+      access.onstatechange = () => {
+        const now = list()
+        const cur = syncRef.current
+        // Reattach to the followed input (a reconnected port is a new object); drop it if gone.
+        if (cur !== 'internal') followInput(now.some((i) => i.id === cur) ? cur : 'internal')
+        else if (count === 0 && now.length === 1) followInput(now[0].id)
+        count = now.length
+        setMidiInputs(now)
+      }
       setMidiInputs(inputs)
-      if (inputs.length > 0) followInput(inputs[0].id)
+      // With several inputs, let the user pick.
+      if (inputs.length === 1) followInput(inputs[0].id)
     } catch {
-      setMidiInputs([])
+      setMidiInputs('denied')
     }
   }
 
@@ -378,6 +391,10 @@ export default function App() {
                 <option value="internal">内部</option>
                 {midiInputs === null ? (
                   <option value="request">MIDI クロック</option>
+                ) : midiInputs === 'denied' ? (
+                  <option value="none" disabled>
+                    MIDI が許可されていません
+                  </option>
                 ) : midiInputs.length === 0 ? (
                   <option value="none" disabled>
                     MIDI 入力なし

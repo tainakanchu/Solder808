@@ -49,3 +49,5 @@ export type FromWorklet =
   | { type: 'error'; message: string }
   /** The engine was rebuilt after an error; settings must be sent again. */
   | { type: 'reset' }
+  /** The worklet started or stopped on its own (joining a running MIDI clock). */
+  | { type: 'transport'; playing: boolean }
