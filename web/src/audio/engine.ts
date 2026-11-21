@@ -10,8 +10,21 @@ export type AudioEngine = {
 
 export type LatencyMode = 'interactive' | 'balanced' | 'playback'
 
+/**
+ * The engine oversamples internally, so its cost scales with the context rate:
+ * ask for 48 kHz rather than inherit 96 kHz from an audio interface (the browser
+ * resamples to the device). Browsers that refuse the rate get their default.
+ */
+function createContext(latencyHint: LatencyMode): AudioContext {
+  try {
+    return new AudioContext({ latencyHint, sampleRate: 48000 })
+  } catch {
+    return new AudioContext({ latencyHint })
+  }
+}
+
 export async function startEngine(latencyHint: LatencyMode = 'interactive'): Promise<AudioEngine> {
-  const ctx = new AudioContext({ latencyHint })
+  const ctx = createContext(latencyHint)
   const [wasm] = await Promise.all([
     fetch(wasmUrl).then((r) => r.arrayBuffer()),
     ctx.audioWorklet.addModule(processorUrl),

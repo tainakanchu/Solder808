@@ -1,4 +1,5 @@
 import {
+  COMMON,
   SLOTS,
   VOICES,
   type FromWorklet,
@@ -17,6 +18,11 @@ type Exports = {
   engine_process(e: number, frames: number): void
   engine_trigger(e: number, slot: number, accent: number): void
   engine_set_knob(e: number, voice: number, id: number, value: number): void
+  /** Missing in engines built before the tom/conga, RS/CL and CP/MA switches. */
+  engine_set_switch?(e: number, voice: number, value: number): void
+  /** Missing in engines built before switchable oversampling. */
+  engine_set_oversample?(e: number, factor: number): void
+  engine_oversample?(e: number): number
   engine_set_master(e: number, value: number): void
   engine_set_accent(e: number, value: number): void
   engine_set_unit(e: number, seed: number, age: number, temp: number): void
@@ -31,6 +37,9 @@ type Exports = {
 }
 
 const SLOT_COUNT = SLOTS.length
+// Engines without engine_set_switch have only BD SD HH CP CB, with the shared
+// circuitry at part-table index 5.
+const LEGACY_VOICES = 5
 const NORMAL = 0.35
 // AudioWorkletGlobalScope often lacks `performance`; Date.now() is only
 // millisecond-accurate, fine for the average but not for one 2.7 ms block.
@@ -70,6 +79,8 @@ class Solder808Processor extends AudioWorkletProcessor {
   private joinable = false
   // A song position arrived since playback last started.
   private sppSet = false
+  // Last requested oversampling, kept so a rebuilt engine starts at it (0 = engine default).
+  private oversample = 0
 
   constructor(options: { processorOptions: { wasm: ArrayBuffer } }) {
     super()
@@ -84,6 +95,21 @@ class Solder808Processor extends AudioWorkletProcessor {
     const instance = new WebAssembly.Instance(this.module, {})
     this.x = instance.exports as unknown as Exports
     this.e = this.x.engine_new(sampleRate)
+    // The app re-sends every setting after a reset; applying this one at once
+    // keeps an overloaded device from rendering the first blocks at 2x.
+    if (this.oversample && typeof this.x.engine_set_oversample === 'function')
+      this.x.engine_set_oversample(this.e, this.oversample)
+  }
+
+  private get legacy() {
+    return typeof this.x.engine_set_switch !== 'function'
+  }
+
+  /** Engine part-table index for a UI voice, or −1 when this engine lacks it. */
+  private partVoice(v: number) {
+    if (!this.legacy) return v
+    if (v === COMMON) return LEGACY_VOICES
+    return v < LEGACY_VOICES ? v : -1
   }
 
   private send(msg: FromWorklet) {
@@ -99,14 +125,17 @@ class Solder808Processor extends AudioWorkletProcessor {
       case 'knob':
         x.engine_set_knob(e, m.voice, m.id, m.value)
         break
+      case 'switch':
+        if (typeof x.engine_set_switch === 'function') x.engine_set_switch(e, m.voice, m.value)
+        break
       case 'unit':
         x.engine_set_unit(e, m.seed >>> 0, m.age, m.temp)
-        this.sendParts()
         break
-      case 'part':
-        x.engine_set_part_scale(e, m.voice, m.index, m.scale)
-        this.sendParts()
+      case 'part': {
+        const v = this.partVoice(m.voice)
+        if (v >= 0) x.engine_set_part_scale(e, v, m.index, m.scale)
         break
+      }
       case 'master':
         x.engine_set_master(e, m.value)
         break
@@ -127,6 +156,11 @@ class Solder808Processor extends AudioWorkletProcessor {
         if (!m.playing) this.rollLeft.fill(0)
         if (this.playing && !m.playing) this.joinable = false
         this.playing = m.playing
+        break
+      case 'oversample':
+        if (m.factor !== 1 && m.factor !== 2) break
+        this.oversample = m.factor
+        if (typeof x.engine_set_oversample === 'function') x.engine_set_oversample(e, m.factor)
         break
       case 'getParts':
         this.sendParts()
@@ -200,9 +234,10 @@ class Solder808Processor extends AudioWorkletProcessor {
   private sendParts() {
     const { x, e } = this
     const voices: PartInfo[][] = []
-    for (let v = 0; v <= VOICES.length; v++) {
+    for (let uv = 0; uv <= VOICES.length; uv++) {
       const parts: PartInfo[] = []
-      const n = x.engine_part_count(e, v)
+      const v = this.partVoice(uv)
+      const n = v >= 0 ? x.engine_part_count(e, v) : 0
       for (let i = 0; i < n; i++) {
         const ptr = x.engine_part_name_ptr(e, v, i)
         const len = x.engine_part_name_len(e, v, i)
@@ -270,7 +305,19 @@ class Solder808Processor extends AudioWorkletProcessor {
     this.peakLoad = Math.max(this.peakLoad, busy / budget)
     if (this.audioMs >= 500) {
       const clockBpm = this.sync === 'midi' && this.tickLen > 0 ? (sampleRate * 60) / (this.tickLen * 24) : -1
-      this.send({ type: 'stats', load: this.busyMs / this.audioMs, peakLoad: HIRES ? this.peakLoad : -1, clockBpm })
+      const { x } = this
+      // 0 tells the app this engine cannot switch (it lacks the setter or the getter).
+      const oversample =
+        typeof x.engine_set_oversample === 'function' && typeof x.engine_oversample === 'function'
+          ? x.engine_oversample(this.e)
+          : 0
+      this.send({
+        type: 'stats',
+        load: this.busyMs / this.audioMs,
+        peakLoad: HIRES ? this.peakLoad : -1,
+        clockBpm,
+        oversample,
+      })
       this.busyMs = 0
       this.audioMs = 0
       this.peakLoad = 0
